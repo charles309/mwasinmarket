@@ -1,7 +1,57 @@
 <?php
 // =============================================================
-//  MwasinMarket — Prediction Market API  v4.7
+//  MwasinMarket — Prediction Market API  v4.8
 //  Single file · LMSR + Fixed-odds pricing · MySQL 8+
+//
+//  CHANGES FROM v4.7  (security & validation hardening — audit Phase 1)
+//  ──────────────────────────────────────────────────────────
+//  [SEC]   64 KB hard cap on POST body — bounded stream read so
+//          a hostile multi-megabyte payload can never exhaust
+//          PHP memory. Returns 413 when exceeded.
+//  [SEC]   Malformed JSON now returns 400 with the parse error
+//          instead of being silently treated as an empty object.
+//  [SEC]   Removed hardcoded "NewStrongPassword123!" fallback
+//          for DB_PASS. Missing env var now fails closed.
+//  [SEC]   read_bearer() fallback no longer scans every $_SERVER
+//          key for "AUTHORIZATION". An attacker-controlled header
+//          (e.g. X-Forwarded-Authorization on some proxy setups)
+//          could otherwise impersonate the real Authorization
+//          header. The fallback now consults a fixed allowlist:
+//          HTTP_AUTHORIZATION, REDIRECT_HTTP_AUTHORIZATION,
+//          HTTP_X_AUTHORIZATION, AUTHORIZATION.
+//  [SEC]   New strict_positive_amount() / strict_positive_int() /
+//          strict_signed_amount() validators reject booleans,
+//          arrays, objects, NaN/INF, scientific notation, and
+//          strings with trailing junk. Plain `(float)$body['x']`
+//          previously allowed `true` → 1.0 and `[1,2]` → 0.0 to
+//          bypass numeric guards. Applied to bet (market_id,
+//          outcome_id, amount), admin_create_market (b, stakes,
+//          max_odds, outcome odds), admin_adjust_limits,
+//          admin_credit_user (user_id, amount), admin_settle_market
+//          (winning_outcome_id), admin_set_liquidity (b).
+//  [SEC]   New validate_market_id() and bounded_text() helpers
+//          enforce length and character limits on every user-
+//          supplied identifier and free-text field (market_id,
+//          slip_id, question, category, source, reason,
+//          pause_reason, note, close_time, odds_mode, etc.).
+//          Prevents DoS via gigantic strings.
+//  [SEC]   Per-user bet rate limit — 30 bets per rolling 60 s
+//          window. Protects FOR UPDATE locks from a single
+//          hammering client and curbs serial price manipulation.
+//  [SEC]   Fixed-mode market creation now requires a minimum
+//          overround of FIXED_MIN_OVERROUND (1.03 = 3% house
+//          edge). Sum(1/odds) below that is rejected at 422 —
+//          previously admins could create a zero-or-negative
+//          margin market that lets users bet every outcome
+//          simultaneously for a guaranteed profit.
+//  [FIX]   bet response `expires_at` now uses the market's
+//          close_time (the bet's real expiry) instead of the
+//          24h TOKEN_TTL. NULL when the market has no deadline.
+//  [CHG]   Removed deprecated maybe_auto_close() — never called
+//          since v3.3 (auto-close runs in its own pre-bet
+//          transaction inside the bet route).
+//  [NEW]   MAX_BODY_BYTES (64 KB) and FIXED_MIN_OVERROUND (1.03)
+//          constants exported in the config section.
 //
 //  CHANGES FROM v4.6
 //  ──────────────────────────────────────────────────────────
@@ -208,16 +258,22 @@ declare(strict_types=1);
 define('DB_HOST',      $_ENV['DB_HOST']      ?? 'localhost');
 define('DB_NAME',      $_ENV['DB_NAME']      ?? 'mwasinmarket');
 define('DB_USER',      $_ENV['DB_USER']      ?? 'root');
-define('DB_PASS',      $_ENV['DB_PASS']      ?? 'NewStrongPassword123!');   // MUST be set in ENV
+define('DB_PASS',      $_ENV['DB_PASS']      ?? '');   // MUST be set in ENV — fail-closed if missing
 define('FRONTEND_URL', $_ENV['FRONTEND_URL'] ?? '');   // Set real origin in production
 define('DEBUG_MODE',   (bool)($_ENV['DEBUG_MODE'] ?? false));  // Set to true for verbose errors (NEVER in production)
 define('TOKEN_TTL',    86400);   // 24 hours
 define('TOKEN_BYTES',  32);      // 64-char hex token
+define('MAX_BODY_BYTES', 65_536); // 64 KB hard cap on request bodies — prevents memory-exhaustion DoS
 
 define('LMSR_B',        1000);   // default liquidity — raised from 100 for stability
 define('LMSR_B_MIN',    50);     // production minimum — prevents extreme volatility
 define('LMSR_B_MAX',    10000);  // production maximum
 define('LMSR_MAX_ODDS', 10.0);   // default max odds cap — bets rejected above this on LMSR markets
+
+// Minimum overround (sum of 1/odds across outcomes) required when creating a
+// fixed-odds market. < 1.0 means the house has a negative edge — a user can
+// bet every outcome simultaneously and guarantee a profit. 1.03 = 3% margin.
+define('FIXED_MIN_OVERROUND', 1.03);
 
 // Timing-safe dummy hash — same algorithm and cost as real hashes
 define('DUMMY_HASH', '$2y$12$abcdefghijklmnopqrstuuABCDEFGHIJKLMNOPQRSTUVWXYZ01234');
@@ -257,7 +313,36 @@ if (strlen(DB_PASS) === 0 && PHP_SAPI !== 'cli') {
 
 $ROUTE  = $_GET['route'] ?? '';
 $METHOD = $_SERVER['REQUEST_METHOD'];
-$BODY   = json_decode(file_get_contents('php://input'), true) ?? [];
+
+// Bounded body read — refuse anything over 64 KB up-front so a hostile
+// payload cannot exhaust PHP memory. Also enforce strict JSON parsing
+// so a malformed body is rejected rather than silently treated as empty.
+$_in = fopen('php://input', 'rb');
+$rawBody = '';
+if ($_in !== false) {
+    while (!feof($_in) && strlen($rawBody) <= MAX_BODY_BYTES) {
+        $chunk = fread($_in, 8192);
+        if ($chunk === false) break;
+        $rawBody .= $chunk;
+    }
+    fclose($_in);
+}
+if (strlen($rawBody) > MAX_BODY_BYTES) {
+    http_response_code(413);
+    echo json_encode(['success' => false, 'error' => 'Request body too large']);
+    exit;
+}
+if ($rawBody === '') {
+    $BODY = [];
+} else {
+    $BODY = json_decode($rawBody, true);
+    if ($BODY === null && json_last_error() !== JSON_ERROR_NONE) {
+        http_response_code(400);
+        echo json_encode(['success' => false, 'error' => 'Malformed JSON: ' . json_last_error_msg()]);
+        exit;
+    }
+    if (!is_array($BODY)) $BODY = [];
+}
 
 // =============================================================
 //  SAFE ROOT RESPONSE — no ?route= given
@@ -364,13 +449,21 @@ function read_bearer(): string {
         }
     }
 
-    // Fallback 3: scan every $_SERVER key for any AUTHORIZATION variant.
-    // Nginx and some CGI stacks may use non-standard casing or prefixes
-    // (e.g. HTTP_AUTHORIZATION, AUTHORIZATION, HTTP_X_AUTHORIZATION).
+    // Fallback 3: check a *fixed* allowlist of $_SERVER keys for known proxy
+    // variants. We must NOT do an open scan (e.g. iterating every $_SERVER key
+    // and grepping for "AUTHORIZATION") — that lets an attacker inject an
+    // arbitrary header such as X-Forwarded-Authorization on infrastructures
+    // where custom headers populate $_SERVER, bypassing the real Authorization.
     if ($h === '') {
-        foreach ($_SERVER as $key => $value) {
-            if (str_contains(strtoupper($key), 'AUTHORIZATION')) {
-                $h = $value;
+        $allowedAuthKeys = [
+            'HTTP_AUTHORIZATION',
+            'REDIRECT_HTTP_AUTHORIZATION',
+            'HTTP_X_AUTHORIZATION',
+            'AUTHORIZATION',
+        ];
+        foreach ($allowedAuthKeys as $key) {
+            if (!empty($_SERVER[$key])) {
+                $h = $_SERVER[$key];
                 break;
             }
         }
@@ -463,6 +556,30 @@ function check_rate_limit(int $max = 10, int $window = 900): void {
 }
 
 /**
+ * Per-user bet rate limit — hard cap of 30 bets per rolling 60-second window.
+ * Protects against:
+ *   • a single user hammering FOR UPDATE locks on a hot market
+ *   • rapid serial bets aimed at LMSR price manipulation
+ *   • bots draining a market's wager cap
+ * Counts open and historical bets alike since the constraint is rate, not state.
+ */
+function check_bet_rate_limit(int $userId, int $max = 30, int $windowSec = 60): void {
+    try {
+        $since = date('Y-m-d H:i:s', time() - $windowSec);
+        $stmt  = db()->prepare(
+            'SELECT COUNT(*) FROM bets WHERE user_id = :uid AND created_at > :since'
+        );
+        $stmt->execute([':uid' => $userId, ':since' => $since]);
+        if ((int)$stmt->fetchColumn() >= $max) {
+            fail('Too many bets in a short period. Please slow down and try again shortly.', 429);
+        }
+    } catch (PDOException $e) {
+        // Never block a legitimate bet because the rate-limit query failed.
+        error_log('[MwasinMarket] check_bet_rate_limit: ' . $e->getMessage());
+    }
+}
+
+/**
  * Remove the most recent login_attempts row for this IP.
  * Call this immediately after a SUCCESSFUL login so that
  * successful logins do not count toward the failure cap.
@@ -478,45 +595,6 @@ function clear_rate_limit_attempt(): void {
               LIMIT 1"
         )->execute([':ip' => client_ip()]);
     } catch (Throwable) { /* non-fatal */ }
-}
-
-
-// =============================================================
-//  SECTION 7 — AUTO-CLOSE HELPER (DEPRECATED)
-//
-//  NOTE: As of v3.3, auto-close is handled in a separate
-//  pre-bet transaction (see the bet route). This function is
-//  retained for backward compatibility but is no longer called
-//  internally. The separate-transaction approach ensures the
-//  close persists even when the bet is rejected.
-// =============================================================
-function maybe_auto_close(array &$mkt, PDO $pdo): void {
-    // Only auto-close open markets (paused markets await manual action)
-    if ($mkt['status'] !== 'open') return;
-    if (!$mkt['close_time'])       return;
-    if (strtotime($mkt['close_time']) >= time()) return;
-
-    // close_time has passed — transition to closed
-    $pdo->prepare("UPDATE markets SET status='closed' WHERE id=:mid")
-        ->execute([':mid' => (int)$mkt['id']]);
-
-    // Log without blocking (post-commit audit_log would not run here,
-    // so we write directly — this is inside the transaction intentionally)
-    try {
-        db()->prepare("INSERT INTO audit_logs (admin_id,action,target_type,target_id,meta)
-            VALUES (0,'auto_closed','market',:mid,:m)")
-            ->execute([
-                ':mid' => (int)$mkt['id'],
-                ':m'   => json_encode([
-                    'market_id'  => $mkt['market_id'],
-                    'close_time' => $mkt['close_time'],
-                    'reason'     => 'close_time deadline reached — auto-closed by system',
-                ]),
-            ]);
-    } catch (Throwable) { /* non-fatal */ }
-
-    // Update the local copy so the caller sees the new status
-    $mkt['status'] = 'closed';
 }
 
 
@@ -643,6 +721,107 @@ function require_fields(array $body, array $fields): void {
 function valid_email(string $e): bool { return (bool)filter_var($e, FILTER_VALIDATE_EMAIL); }
 function new_slip_id(): string   { return 'BET_' . strtoupper(bin2hex(random_bytes(4))); }
 function new_market_id(): string { return bin2hex(random_bytes(8)); }
+
+/**
+ * Strict positive-amount validator.
+ *
+ * Plain `(float)$body['amount']` silently accepts:
+ *   • booleans     — (float)true  = 1.0
+ *   • arrays       — (float)[1,2] = 0.0  (passes "> 0" if min allows it)
+ *   • objects      — fatal error or 1.0
+ *   • "2e5"        — accepted as 200000 (or 2 with int cast)
+ *   • "  1.5 abc"  — accepted as 1.5
+ *
+ * This validator rejects all of those, plus NaN/INF, before returning a float.
+ */
+function strict_positive_amount(mixed $val, string $field, float $min = 0.01, float $max = 10_000_000.0): float {
+    if (is_bool($val) || is_array($val) || is_object($val) || $val === null) {
+        fail("$field must be a numeric value", 422, [$field]);
+    }
+    if (is_string($val)) {
+        $trimmed = trim($val);
+        if ($trimmed === '' || !preg_match('/^-?\d+(\.\d+)?$/', $trimmed)) {
+            fail("$field must be a plain decimal number (no scientific notation, no trailing text)", 422, [$field]);
+        }
+        $val = $trimmed;
+    } elseif (!is_int($val) && !is_float($val)) {
+        fail("$field must be a numeric value", 422, [$field]);
+    }
+    $f = (float)$val;
+    if (!is_finite($f))            fail("$field must be a finite number", 422, [$field]);
+    if ($f < $min)                 fail("$field must be >= $min", 422, [$field]);
+    if ($f > $max)                 fail("$field must be <= " . number_format($max, 2), 422, [$field]);
+    return round($f, 2);
+}
+
+/**
+ * Strict positive-integer validator — rejects booleans, arrays, floats,
+ * scientific notation, and any value that isn't a plain positive integer.
+ */
+function strict_positive_int(mixed $val, string $field): int {
+    if (is_bool($val) || is_array($val) || is_object($val) || $val === null) {
+        fail("$field must be a positive integer", 422, [$field]);
+    }
+    if (is_int($val)) {
+        if ($val <= 0) fail("$field must be a positive integer greater than 0", 422, [$field]);
+        return $val;
+    }
+    $s = is_string($val) ? trim($val) : (string)$val;
+    if (!preg_match('/^\d+$/', $s)) {
+        fail("$field must be a positive integer", 422, [$field]);
+    }
+    $i = (int)$s;
+    if ($i <= 0) fail("$field must be a positive integer greater than 0", 422, [$field]);
+    return $i;
+}
+
+/** Strict numeric float that *may* be negative (e.g. admin_credit_user amount). */
+function strict_signed_amount(mixed $val, string $field, float $maxAbs = 10_000_000.0): float {
+    if (is_bool($val) || is_array($val) || is_object($val) || $val === null) {
+        fail("$field must be a numeric value", 422, [$field]);
+    }
+    if (is_string($val)) {
+        $trimmed = trim($val);
+        if ($trimmed === '' || !preg_match('/^-?\d+(\.\d+)?$/', $trimmed)) {
+            fail("$field must be a plain decimal number (no scientific notation, no trailing text)", 422, [$field]);
+        }
+        $val = $trimmed;
+    } elseif (!is_int($val) && !is_float($val)) {
+        fail("$field must be a numeric value", 422, [$field]);
+    }
+    $f = (float)$val;
+    if (!is_finite($f))      fail("$field must be a finite number", 422, [$field]);
+    if (abs($f) > $maxAbs)   fail("$field exceeds the per-transaction limit of KES " . number_format($maxAbs, 2), 422, [$field]);
+    return round($f, 2);
+}
+
+/**
+ * Validate a market_id string from user input.
+ * Allows alphanumerics, underscore and dash, length 1–64. Trims whitespace.
+ */
+function validate_market_id(mixed $val, string $field = 'market_id'): string {
+    if (!is_string($val)) fail("$field must be a string", 422, [$field]);
+    $v = trim($val);
+    if ($v === '')                                  fail("$field is required", 422, [$field]);
+    if (!preg_match('/^[A-Za-z0-9_\-]{1,64}$/', $v)) fail("$field must be 1–64 alphanumeric characters (plus _ and -)", 422, [$field]);
+    return $v;
+}
+
+/**
+ * Cap user-supplied text fields so they can't be used for DoS via huge strings.
+ * Returns the trimmed value. Validates type, optional emptiness, and max length.
+ */
+function bounded_text(mixed $val, string $field, int $max, bool $allowEmpty = true): string {
+    if ($val === null) {
+        if ($allowEmpty) return '';
+        fail("$field is required", 422, [$field]);
+    }
+    if (!is_string($val)) fail("$field must be a string", 422, [$field]);
+    $v = trim($val);
+    if (!$allowEmpty && $v === '') fail("$field is required", 422, [$field]);
+    if (mb_strlen($v) > $max)      fail("$field max $max characters", 422, [$field]);
+    return $v;
+}
 
 
 // =============================================================
@@ -839,18 +1018,18 @@ $ROUTE === 'register' && $METHOD === 'POST' => (function () use ($BODY) {
     check_rate_limit(20, 3600); // 20 registrations per IP per hour
     require_fields($BODY, ['username', 'email', 'phone', 'full_name', 'password']);
 
-    $username  = trim($BODY['username']);
-    $email     = strtolower(trim($BODY['email']));
-    $phone     = trim($BODY['phone']);
-    $full_name = trim($BODY['full_name']);
-    $password  = $BODY['password'];
+    $username  = bounded_text($BODY['username'],  'username',  60, allowEmpty: false);
+    $email     = strtolower(bounded_text($BODY['email'], 'email', 254, allowEmpty: false));
+    $phone     = bounded_text($BODY['phone'],     'phone',     20, allowEmpty: false);
+    $full_name = bounded_text($BODY['full_name'], 'full_name', 100, allowEmpty: false);
+    $password  = is_string($BODY['password'] ?? null) ? $BODY['password'] : '';
 
     $errors = [];
-    if (!valid_email($email))                   $errors[] = 'Invalid email address';
-    if (strlen($password) < 8)                  $errors[] = 'Password must be at least 8 characters';
-    if (!preg_match('/^\+?\d{9,15}$/', $phone)) $errors[] = 'Invalid phone number (e.g. +254712345678)';
-    if (strlen($username) < 3)                  $errors[] = 'Username must be at least 3 characters';
-    if (strlen($username) > 60)                 $errors[] = 'Username max 60 characters';
+    if (!valid_email($email))                    $errors[] = 'Invalid email address';
+    if (strlen($password) < 8)                   $errors[] = 'Password must be at least 8 characters';
+    if (strlen($password) > 128)                 $errors[] = 'Password max 128 characters';
+    if (!preg_match('/^\+?\d{9,15}$/', $phone))  $errors[] = 'Invalid phone number (e.g. +254712345678)';
+    if (strlen($username) < 3)                   $errors[] = 'Username must be at least 3 characters';
     if (!preg_match('/^\w+$/', $username))       $errors[] = 'Username: letters, numbers, underscore only';
     if ($errors) fail('Validation failed', 422, $errors);
 
@@ -1237,11 +1416,14 @@ $ROUTE === 'bet' && $METHOD === 'POST' => (function () use ($BODY) {
     $ctx    = require_auth();
     $userId = $ctx['user_id'];
 
+    // Per-user rate limit BEFORE any FOR UPDATE locks are taken,
+    // so a flood from one user never starves the rest of the market.
+    check_bet_rate_limit($userId);
+
     require_fields($BODY, ['market_id', 'outcome_id', 'amount']);
-    $extMid    = trim($BODY['market_id']);
-    $outcomeId = (int)$BODY['outcome_id'];
-    $amount    = (float)$BODY['amount'];
-    if ($amount <= 0) fail('Amount must be greater than 0', 422);
+    $extMid    = validate_market_id($BODY['market_id']);
+    $outcomeId = strict_positive_int($BODY['outcome_id'], 'outcome_id');
+    $amount    = strict_positive_amount($BODY['amount'], 'amount');
 
     $pdo = db();
 
@@ -1395,7 +1577,10 @@ $ROUTE === 'bet' && $METHOD === 'POST' => (function () use ($BODY) {
 
         // ── Insert bet record ─────────────────────────────
         $slipId    = new_slip_id();
-        $expiresAt = date('Y-m-d H:i:s', time() + TOKEN_TTL);
+        // A bet's natural expiry is the market's close_time (when betting
+        // stops), not the auth TOKEN_TTL. NULL when the market has no
+        // deadline; the bet then lives until the market is settled or voided.
+        $expiresAt = $mkt['close_time'] ?: null;
 
         $pdo->prepare("INSERT INTO bets
             (slip_id,user_id,market_id,outcome_id,shares,stake,odds_at_entry,
@@ -1517,24 +1702,29 @@ $ROUTE === 'admin_create_market' && $METHOD === 'POST' => (function () use ($BOD
     $adminId = $ctx['user_id'];
 
     require_fields($BODY, ['question', 'category', 'outcomes']);
-    $question    = trim($BODY['question']);
-    $category    = strtolower(trim($BODY['category']));
-    $source      = trim($BODY['source']               ?? 'local');
-    $closeTime   = trim($BODY['close_time']           ?? '');
-    $customId    = trim($BODY['market_id']            ?? '');
-    $b           = (float)($BODY['b']                 ?? LMSR_B);
-    $minStake    = (float)($BODY['min_stake']          ?? 10);
-    $maxStake    = (float)($BODY['max_stake']          ?? 100000);
-    $maxTotalWag = (float)($BODY['max_total_wagered']  ?? 0);
-    $marketType  = trim($BODY['market_type']           ?? 'binary');
-    $outcomes    = $BODY['outcomes']                   ?? [];
-    $oddsMode    = trim($BODY['odds_mode']             ?? 'lmsr');
+    $question    = bounded_text($BODY['question'], 'question', 500, allowEmpty: false);
+    $category    = strtolower(bounded_text($BODY['category'], 'category', 60, allowEmpty: false));
+    $source      = bounded_text($BODY['source'] ?? 'local', 'source', 60);
+    if ($source === '') $source = 'local';
+    $closeTime   = bounded_text($BODY['close_time'] ?? '', 'close_time', 25);
+    $customId    = isset($BODY['market_id']) && $BODY['market_id'] !== ''
+        ? validate_market_id($BODY['market_id']) : '';
+    $b           = strict_positive_amount($BODY['b']                ?? LMSR_B,    'b', 0.0001, 1_000_000.0);
+    $minStake    = strict_positive_amount($BODY['min_stake']        ?? 10,        'min_stake');
+    $maxStake    = strict_positive_amount($BODY['max_stake']        ?? 100000,    'max_stake');
+    $maxTotalWag = strict_positive_amount($BODY['max_total_wagered'] ?? 0,        'max_total_wagered', 0.0);
+    $marketType  = bounded_text($BODY['market_type'] ?? 'binary', 'market_type', 20);
+    $outcomes    = $BODY['outcomes'] ?? [];
+    if (!is_array($outcomes)) fail('outcomes must be an array', 422, ['outcomes']);
+    $oddsMode    = bounded_text($BODY['odds_mode']  ?? 'lmsr', 'odds_mode', 10);
     // max_odds: LMSR only — reject bets when live odds exceed this value.
     // Default 10.0 means no outcome can be bet above 10× return.
     // Fixed markets ignore this (admin controls exact odds directly).
-    $maxOdds     = (float)($BODY['max_odds']           ?? LMSR_MAX_ODDS);
+    $maxOdds     = strict_positive_amount($BODY['max_odds'] ?? LMSR_MAX_ODDS, 'max_odds', 0.0001, 1000.0);
 
     $errors = [];
+    if (mb_strlen($question) < 10)                              $errors[] = 'question must be at least 10 characters';
+    if (mb_strlen($category) < 2)                               $errors[] = 'category must be at least 2 characters';
     if (!in_array($marketType, ['binary','categorical'], true)) $errors[] = 'market_type must be binary or categorical';
     if (!in_array($oddsMode,   ['lmsr','fixed'],         true)) $errors[] = 'odds_mode must be lmsr or fixed';
     if ($marketType === 'binary' && count($outcomes) !== 2)     $errors[] = 'binary markets must have exactly 2 outcomes';
@@ -1556,29 +1746,52 @@ $ROUTE === 'admin_create_market' && $METHOD === 'POST' => (function () use ($BOD
 
     $seenNames = [];
     foreach ($outcomes as $i => $o) {
-        $name = trim($o['name'] ?? '');
+        if (!is_array($o)) { $errors[] = "outcome[$i] must be an object"; continue; }
+        $name = isset($o['name']) ? bounded_text($o['name'], "outcome[$i].name", 80) : '';
         if (!$name) { $errors[] = "outcome[$i]: name required"; continue; }
         $key  = strtolower($name);
         if (in_array($key, $seenNames, true)) $errors[] = "Duplicate outcome name: $name";
         $seenNames[] = $key;
 
-        if ($oddsMode === 'fixed') {
-            // Fixed mode: each outcome must have decimal odds > 1.0
-            if (!isset($o['odds'])) {
-                $errors[] = "outcome[$i] '$name': 'odds' required (e.g. 1.85 means a 1.85× return).";
-            } elseif ((float)$o['odds'] <= 1.0) {
-                $errors[] = "outcome[$i] '$name': odds must be > 1.0 (e.g. 2.50). Got: {$o['odds']}";
-            }
-        } else {
-            // LMSR mode: decimal odds > 1.0 required for every outcome
-            if (!isset($o['odds'])) {
-                $errors[] = "outcome[$i] '$name': 'odds' required (e.g. 2.00 means 2× return).";
-            } elseif ((float)$o['odds'] <= 1.0) {
-                $errors[] = "outcome[$i] '$name': odds must be > 1.0 (EU decimal format, e.g. 2.00). Got: {$o['odds']}";
-            }
+        if (!isset($o['odds'])) {
+            $errors[] = "outcome[$i] '$name': 'odds' required (EU decimal, e.g. 2.00 means 2× return).";
+            continue;
+        }
+        // Reject booleans, arrays, NaN, scientific notation in odds
+        if (is_bool($o['odds']) || is_array($o['odds']) || is_object($o['odds'])
+            || (is_string($o['odds']) && !preg_match('/^-?\d+(\.\d+)?$/', trim($o['odds'])))) {
+            $errors[] = "outcome[$i] '$name': odds must be a plain decimal number.";
+            continue;
+        }
+        $oddsVal = (float)$o['odds'];
+        if (!is_finite($oddsVal) || $oddsVal <= 1.0) {
+            $errors[] = "outcome[$i] '$name': odds must be > 1.0 (EU decimal, e.g. 2.00). Got: {$o['odds']}";
+        }
+        if ($oddsVal > 1000.0) {
+            $errors[] = "outcome[$i] '$name': odds must be <= 1000.0";
         }
     }
     if ($errors) fail('Validation failed', 422, $errors);
+
+    // Fixed-mode overround guard — prevents zero-margin arbitrage.
+    // If sum(1/odds) <= 1.0 the house has no edge and a user can bet every
+    // outcome simultaneously to guarantee a payout >= total stake.
+    if ($oddsMode === 'fixed') {
+        $impliedSum = 0.0;
+        foreach ($outcomes as $o) $impliedSum += 1.0 / max(1.0001, (float)$o['odds']);
+        if ($impliedSum < FIXED_MIN_OVERROUND) {
+            fail(
+                sprintf(
+                    'Fixed market overround too low (implied probability sum = %.4f). '
+                    . 'Sum of 1/odds across all outcomes must be >= %.2f so the house keeps an edge. '
+                    . 'Tighten one or more odds and try again.',
+                    $impliedSum, FIXED_MIN_OVERROUND
+                ),
+                422,
+                ['implied_sum' => round($impliedSum, 4), 'minimum_required' => FIXED_MIN_OVERROUND]
+            );
+        }
+    }
 
     $normProbs = normalize_probs($outcomes);
     $sharesVec = seed_shares($normProbs, $b);
@@ -1704,8 +1917,9 @@ $ROUTE === 'admin_pause_market' && $METHOD === 'POST' => (function () use ($BODY
     $ctx     = require_admin();
     $adminId = $ctx['user_id'];
     require_fields($BODY, ['market_id']);
-    $extMid      = trim($BODY['market_id']);
-    $pauseReason = trim($BODY['pause_reason'] ?? 'Paused by admin');
+    $extMid      = validate_market_id($BODY['market_id']);
+    $pauseReason = bounded_text($BODY['pause_reason'] ?? 'Paused by admin', 'pause_reason', 500);
+    if ($pauseReason === '') $pauseReason = 'Paused by admin';
 
     $pdo = db(); $pdo->beginTransaction();
     try {
@@ -1736,7 +1950,7 @@ $ROUTE === 'admin_resume_market' && $METHOD === 'POST' => (function () use ($BOD
     $ctx     = require_admin();
     $adminId = $ctx['user_id'];
     require_fields($BODY, ['market_id']);
-    $extMid = trim($BODY['market_id']);
+    $extMid = validate_market_id($BODY['market_id']);
 
     $pdo = db(); $pdo->beginTransaction();
     try {
@@ -1768,8 +1982,9 @@ $ROUTE === 'admin_force_close_market' && $METHOD === 'POST' => (function () use 
     $ctx     = require_admin();
     $adminId = $ctx['user_id'];
     require_fields($BODY, ['market_id']);
-    $extMid = trim($BODY['market_id']);
-    $reason = trim($BODY['reason'] ?? 'Closed by admin pending settlement');
+    $extMid = validate_market_id($BODY['market_id']);
+    $reason = bounded_text($BODY['reason'] ?? 'Closed by admin pending settlement', 'reason', 500);
+    if ($reason === '') $reason = 'Closed by admin pending settlement';
 
     $pdo = db(); $pdo->beginTransaction();
     try {
@@ -1811,8 +2026,8 @@ $ROUTE === 'admin_settle_market' && $METHOD === 'POST' => (function () use ($BOD
     $adminId = $ctx['user_id'];
 
     require_fields($BODY, ['market_id', 'winning_outcome_id']);
-    $extMid   = trim($BODY['market_id']);
-    $winOutId = (int)$BODY['winning_outcome_id'];
+    $extMid   = validate_market_id($BODY['market_id']);
+    $winOutId = strict_positive_int($BODY['winning_outcome_id'], 'winning_outcome_id');
 
     $pdo = db();
     $pdo->beginTransaction();
@@ -1909,8 +2124,9 @@ $ROUTE === 'admin_void_market' && $METHOD === 'POST' => (function () use ($BODY)
     $ctx     = require_admin();
     $adminId = $ctx['user_id'];
     require_fields($BODY, ['market_id']);
-    $extMid = trim($BODY['market_id']);
-    $reason = trim($BODY['reason'] ?? 'Voided by admin');
+    $extMid = validate_market_id($BODY['market_id']);
+    $reason = bounded_text($BODY['reason'] ?? 'Voided by admin', 'reason', 500);
+    if ($reason === '') $reason = 'Voided by admin';
 
     $pdo = db(); $pdo->beginTransaction();
     try {
@@ -1996,8 +2212,12 @@ $ROUTE === 'admin_void_bet' && $METHOD === 'POST' => (function () use ($BODY) {
     $ctx     = require_admin();
     $adminId = $ctx['user_id'];
     require_fields($BODY, ['slip_id']);
-    $slipId = trim($BODY['slip_id']);
-    $reason = trim($BODY['reason'] ?? 'Revoked by admin');
+    $slipId = bounded_text($BODY['slip_id'], 'slip_id', 32, allowEmpty: false);
+    if (!preg_match('/^[A-Za-z0-9_\-]{1,32}$/', $slipId)) {
+        fail('slip_id must be 1–32 alphanumeric characters (plus _ and -)', 422, ['slip_id']);
+    }
+    $reason = bounded_text($BODY['reason'] ?? 'Revoked by admin', 'reason', 500);
+    if ($reason === '') $reason = 'Revoked by admin';
 
     $pdo = db(); $pdo->beginTransaction();
     try {
@@ -2071,7 +2291,7 @@ $ROUTE === 'admin_archive_market' && $METHOD === 'POST' => (function () use ($BO
     $ctx     = require_admin();
     $adminId = $ctx['user_id'];
     require_fields($BODY, ['market_id']);
-    $extMid  = trim($BODY['market_id']);
+    $extMid  = validate_market_id($BODY['market_id']);
     $archive = (bool)($BODY['archive'] ?? true);
 
     $pdo = db(); $pdo->beginTransaction();
@@ -2105,14 +2325,20 @@ $ROUTE === 'admin_edit_market' && $METHOD === 'POST' => (function () use ($BODY)
     $ctx     = require_admin();
     $adminId = $ctx['user_id'];
     require_fields($BODY, ['market_id']);
-    $extMid  = trim($BODY['market_id']);
+    $extMid  = validate_market_id($BODY['market_id']);
+    $textLimits = ['question' => 500, 'category' => 60, 'source' => 60];
     $updates = [];
-    foreach (['question','category','source'] as $f) {
-        if (isset($BODY[$f]) && trim($BODY[$f]) !== '') $updates[$f] = trim($BODY[$f]);
+    foreach ($textLimits as $f => $max) {
+        if (!array_key_exists($f, $BODY)) continue;
+        $v = bounded_text($BODY[$f], $f, $max);
+        if ($v !== '') $updates[$f] = $v;
     }
     // odds_mode is intentionally NOT editable here — use admin_set_odds_mode which
     // handles the full migration (fixed_odds write/clear, open-bet safety gate, snapshot).
     if (empty($updates)) fail('Provide at least one editable field: question, category, source', 422);
+    if (isset($updates['question']) && mb_strlen($updates['question']) < 10) {
+        fail('question must be at least 10 characters', 422, ['question']);
+    }
     if (isset($updates['category'])) $updates['category'] = strtolower($updates['category']);
 
     $pdo = db(); $pdo->beginTransaction(); $mkt = null;
@@ -2145,7 +2371,7 @@ $ROUTE === 'admin_adjust_limits' && $METHOD === 'POST' => (function () use ($BOD
     $ctx     = require_admin();
     $adminId = $ctx['user_id'];
     require_fields($BODY,['market_id']);
-    $extMid = trim($BODY['market_id']);
+    $extMid = validate_market_id($BODY['market_id']);
 
     $pdo = db(); $pdo->beginTransaction(); $mkt=null;
     try {
@@ -2156,10 +2382,10 @@ $ROUTE === 'admin_adjust_limits' && $METHOD === 'POST' => (function () use ($BOD
         if (in_array($mkt['status'],['resolved','voided'],true))
             throw new RuntimeException("Cannot adjust limits on a {$mkt['status']} market.|409");
 
-        $newMin    = isset($BODY['min_stake'])          ? (float)$BODY['min_stake']          : (float)$mkt['min_stake'];
-        $newMax    = isset($BODY['max_stake'])          ? (float)$BODY['max_stake']          : (float)$mkt['max_stake'];
-        $newCap    = isset($BODY['max_total_wagered'])  ? (float)$BODY['max_total_wagered']  : (float)$mkt['max_total_wagered'];
-        $newMaxOdds= isset($BODY['max_odds'])           ? (float)$BODY['max_odds']           : (float)($mkt['max_odds'] ?? LMSR_MAX_ODDS);
+        $newMin    = isset($BODY['min_stake'])          ? strict_positive_amount($BODY['min_stake'],         'min_stake')         : (float)$mkt['min_stake'];
+        $newMax    = isset($BODY['max_stake'])          ? strict_positive_amount($BODY['max_stake'],         'max_stake')         : (float)$mkt['max_stake'];
+        $newCap    = isset($BODY['max_total_wagered'])  ? strict_positive_amount($BODY['max_total_wagered'], 'max_total_wagered', 0.0) : (float)$mkt['max_total_wagered'];
+        $newMaxOdds= isset($BODY['max_odds'])           ? strict_positive_amount($BODY['max_odds'],          'max_odds', 0.0001, 1000.0) : (float)($mkt['max_odds'] ?? LMSR_MAX_ODDS);
 
         $errors=[];
         if ($newMin<1)        $errors[]='min_stake must be >= 1';
@@ -2204,8 +2430,8 @@ $ROUTE === 'admin_extend_close_time' && $METHOD === 'POST' => (function () use (
     $ctx     = require_admin();
     $adminId = $ctx['user_id'];
     require_fields($BODY,['market_id','close_time']);
-    $extMid = trim($BODY['market_id']);
-    $newCT=trim($BODY['close_time']);
+    $extMid = validate_market_id($BODY['market_id']);
+    $newCT  = bounded_text($BODY['close_time'], 'close_time', 25, allowEmpty: false);
     if (!strtotime($newCT)) fail('Invalid close_time. Use Y-m-d H:i:s.',422);
     $newTs=strtotime($newCT);
     if ($newTs<=time()) fail('New close_time must be in the future.',422);
@@ -2481,10 +2707,11 @@ $ROUTE === 'admin_reseed_odds' && $METHOD === 'POST' => (function () use ($BODY)
     $adminId = $ctx['user_id'];
 
     require_fields($BODY, ['market_id', 'outcomes']);
-    $extMid   = trim($BODY['market_id']);
+    $extMid   = validate_market_id($BODY['market_id']);
     $incoming = $BODY['outcomes'] ?? [];
     $force    = (bool)($BODY['force']  ?? false);
-    $reason   = trim($BODY['reason']   ?? 'Odds reseeded by admin');
+    $reason   = bounded_text($BODY['reason']   ?? 'Odds reseeded by admin', 'reason', 500);
+    if ($reason === '') $reason = 'Odds reseeded by admin';
 
     // ── Basic input validation ─────────────────────────────
     if (empty($incoming) || !is_array($incoming)) {
@@ -2823,8 +3050,8 @@ $ROUTE === 'admin_set_odds_mode' && $METHOD === 'POST' => (function () use ($BOD
     $adminId = $ctx['user_id'];
 
     require_fields($BODY, ['market_id', 'odds_mode']);
-    $extMid   = trim($BODY['market_id']);
-    $newMode  = trim($BODY['odds_mode']);
+    $extMid   = validate_market_id($BODY['market_id']);
+    $newMode  = bounded_text($BODY['odds_mode'], 'odds_mode', 10, allowEmpty: false);
     $force    = (bool)($BODY['force'] ?? false);
     $incoming = $BODY['outcomes'] ?? [];
 
@@ -3100,10 +3327,10 @@ $ROUTE === 'admin_credit_user' && $METHOD === 'POST' => (function () use ($BODY)
 
     require_fields($BODY, ['user_id', 'amount', 'type']);
 
-    $targetUserId = (int)$BODY['user_id'];
-    $amount       = round((float)$BODY['amount'], 2);
-    $type         = trim($BODY['type']);
-    $note         = trim($BODY['note'] ?? '');
+    $targetUserId = strict_positive_int($BODY['user_id'], 'user_id');
+    $amount       = strict_signed_amount($BODY['amount'], 'amount');
+    $type         = bounded_text($BODY['type'], 'type', 20, allowEmpty: false);
+    $note         = bounded_text($BODY['note'] ?? '', 'note', 500);
 
     $allowedTypes = ['deposit', 'bonus', 'withdrawal', 'adjustment'];
     if (!in_array($type, $allowedTypes, true)) {
@@ -3111,9 +3338,6 @@ $ROUTE === 'admin_credit_user' && $METHOD === 'POST' => (function () use ($BODY)
     }
     if ($amount === 0.0) {
         fail('amount cannot be zero', 422);
-    }
-    if (abs($amount) > 10_000_000) {
-        fail('amount exceeds the single-transaction limit of KES 10,000,000', 422);
     }
 
     $pdo = db();
@@ -3222,8 +3446,9 @@ $ROUTE === 'admin_reopen_market' && $METHOD === 'POST' => (function () use ($BOD
     $ctx     = require_admin();
     $adminId = $ctx['user_id'];
     require_fields($BODY, ['market_id']);
-    $extMid = trim($BODY['market_id']);
-    $reason = trim($BODY['reason'] ?? 'Reopened by admin');
+    $extMid = validate_market_id($BODY['market_id']);
+    $reason = bounded_text($BODY['reason'] ?? 'Reopened by admin', 'reason', 500);
+    if ($reason === '') $reason = 'Reopened by admin';
 
     $pdo = db(); $pdo->beginTransaction();
     try {
@@ -3307,8 +3532,8 @@ $ROUTE === 'admin_set_liquidity' && $METHOD === 'POST' => (function () use ($BOD
     $adminId = $ctx['user_id'];
 
     require_fields($BODY, ['market_id', 'b']);
-    $extMid = trim($BODY['market_id']);
-    $newB   = (float)$BODY['b'];
+    $extMid = validate_market_id($BODY['market_id']);
+    $newB   = strict_positive_amount($BODY['b'], 'b', 0.0001, 1_000_000.0);
 
     // Validate b range (same limits enforced on market creation)
     if ($newB < LMSR_B_MIN) fail('b must be >= ' . LMSR_B_MIN . ' (production minimum)', 422);
