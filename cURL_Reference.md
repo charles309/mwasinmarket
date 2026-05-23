@@ -1,10 +1,53 @@
 # MwasinMarket — cURL Reference
 
-**Version:** 5.0
-**Base URL:** `https://yourdomain.com/api/index.php`
+**Version:** 5.1 (single-file build)
+**Deployment:** Drop `api.php` into your webroot. Import `schema.sql` into MySQL 8.0+.
+**Base URL:** `https://yourdomain.com/api.php`
 **Routing:** Query string parameter — `?route=<name>`
 **Auth:** `Authorization: Bearer <64-hex-token>` (where required)
 **Body:** JSON, `Content-Type: application/json`. Max 64 KB.
+
+## Required environment variables
+
+```
+DB_HOST, DB_NAME, DB_USER, DB_PASS         # DB_PASS is mandatory
+FRONTEND_URL                               # https://app.example.com (CORS)
+DEBUG_MODE=false                           # true in dev only
+APP_PUBLIC_URL                             # used in email links
+
+# SMTP (Outlook STARTTLS example):
+SMTP_HOST=smtp-mail.outlook.com
+SMTP_PORT=587
+SMTP_USERNAME=no-reply@mombasa.go.ke
+SMTP_PASSWORD=********
+SMTP_FROM=no-reply@mombasa.go.ke
+SMTP_FROM_NAME=MwasinMarket
+
+# M-Pesa Daraja:
+MPESA_CONSUMER_KEY, MPESA_CONSUMER_SECRET, MPESA_SHORTCODE, MPESA_PASSKEY
+MPESA_CALLBACK_URL, MPESA_B2C_URL, MPESA_IP_WHITELIST, MPESA_WEBHOOK_SECRET
+
+# SMS:
+SMS_PROVIDER=africastalking
+SMS_API_KEY, SMS_USERNAME, SMS_SENDER_ID
+
+# Stickers:
+STICKER_UPLOAD_PATH=/var/www/stickers
+STICKER_BASE_URL=https://cdn.example.com/stickers
+```
+
+## Security model (built-in)
+
+- All user inputs go through prepared statements (`->prepare()->execute()`). No raw `->query()` with user data anywhere.
+- All write transactions use `FOR UPDATE` row locks; balance deductions use `WHERE balance >= stake` guards.
+- Token auth: 64-char hex (32 bytes entropy), stored in DB, revoked on logout/ban/password-reset.
+- 64 KB body cap enforced before JSON parse; multipart upload limited to 512 KB sticker images.
+- Bcrypt cost-12 password hashes; dummy hash compared on missing-user login for timing-attack resistance.
+- LMSR `max_odds` cap (default 10×) and 3% minimum overround on fixed markets — anti-arbitrage.
+- No sell/cash-out route — prevents LMSR round-trip arbitrage entirely.
+- Bonus winnings credit `bonus_balance`, never `balance` — bonus wash protection.
+- M-Pesa receipt UNIQUE constraint — duplicate webhooks are safely ignored.
+- Maintenance gate skips `admin_login`, `admin_maintenance`, `health` only.
 
 ## Response shape
 
@@ -85,8 +128,56 @@ Same as login but requires `role=admin`.
 Auth: User. Revokes the current token.
 ```bash
 curl -X POST -H "Authorization: Bearer $TOKEN" \
-  "https://yourdomain.com/api/index.php?route=logout"
+  "https://yourdomain.com/api.php?route=logout"
 ```
+
+---
+
+# EMAIL VERIFICATION & PASSWORD RESET
+
+All four routes use the configured SMTP server (Outlook STARTTLS by default).
+
+## `POST ?route=request_email_verification`
+Auth: User. Rate-limited 5/IP/hour. Sends a verification email containing a 64-hex token (valid 24 h).
+```bash
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  "https://yourdomain.com/api.php?route=request_email_verification"
+```
+Response:
+```json
+{ "success": true, "message": "Verification email sent", "data": { "email": "user@example.com", "sent": true } }
+```
+Errors: 401 auth · 409 already verified · 429 rate · 502 SMTP failure.
+
+## `POST ?route=verify_email`
+Public. Body: `{ "token": "<64-hex>" }`. Marks `users.email_verified = 1`.
+```bash
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"token":"a1b2..."}' \
+  "https://yourdomain.com/api.php?route=verify_email"
+```
+Errors: 401 invalid/expired · 409 already used · 422 bad token format.
+
+## `POST ?route=request_password_reset`
+Public. Rate-limited 5/IP/hour. Always replies success (prevents email enumeration).
+```bash
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"email":"user@example.com"}' \
+  "https://yourdomain.com/api.php?route=request_password_reset"
+```
+Response:
+```json
+{ "success": true, "message": "If that email is registered, a reset link has been sent", "data": { "sent": true } }
+```
+
+## `POST ?route=reset_password`
+Public. Token valid 1 h. Hashes new password (bcrypt cost 12) and revokes ALL existing tokens for the user.
+```bash
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"token":"a1b2...","new_password":"NewStrongPass!2026"}' \
+  "https://yourdomain.com/api.php?route=reset_password"
+```
+Errors: 401 invalid/expired · 409 already used · 422 bad token or short password.
 
 ---
 

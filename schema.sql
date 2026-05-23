@@ -395,6 +395,41 @@ CREATE TABLE IF NOT EXISTS notifications (
     KEY idx_type         (type)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+-- ============================================================
+-- 19. email_verification_tokens
+-- ============================================================
+CREATE TABLE IF NOT EXISTS email_verification_tokens (
+    id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    user_id     BIGINT UNSIGNED NOT NULL,
+    token       CHAR(64) NOT NULL,
+    expires_at  DATETIME NOT NULL,
+    used_at     DATETIME NULL,
+    created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (id),
+    UNIQUE KEY uniq_evt_token (token),
+    KEY idx_evt_user (user_id),
+    KEY idx_evt_expires (expires_at),
+    CONSTRAINT fk_evt_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ============================================================
+-- 20. password_reset_tokens
+-- ============================================================
+CREATE TABLE IF NOT EXISTS password_reset_tokens (
+    id            BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    user_id       BIGINT UNSIGNED NOT NULL,
+    token         CHAR(64) NOT NULL,
+    expires_at    DATETIME NOT NULL,
+    used_at       DATETIME NULL,
+    requested_ip  VARCHAR(45) NULL,
+    created_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (id),
+    UNIQUE KEY uniq_prt_token (token),
+    KEY idx_prt_user (user_id),
+    KEY idx_prt_expires (expires_at),
+    CONSTRAINT fk_prt_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 SET FOREIGN_KEY_CHECKS = 1;
 
 -- ============================================================
