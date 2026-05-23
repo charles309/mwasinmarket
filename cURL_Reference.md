@@ -230,6 +230,8 @@ Errors: `401` invalid/expired · `409` already used · `422` bad token / passwor
 ## 4. User
 
 ### Profile
+Responsible-gambling note: `total_wagered` and `bet_stats.total_stake` are deliberately **not** included in the user-facing profile so users aren't anchored to a "loss count" that motivates chasing losses. Admins still see them via `admin_credit_user` and `admin_pending_withdrawals` user vetting blocks.
+
 ```bash
 curl -H "Authorization: Bearer $TOKEN" \
   "https://yourdomain.com/api.php?route=profile"
@@ -244,10 +246,10 @@ curl -H "Authorization: Bearer $TOKEN" \
     "is_suspended": false, "messaging_restricted": false,
     "balance": 1500.00, "locked_balance": 200.00,
     "available_balance": 1300.00, "bonus_balance": 0.00,
-    "total_wagered": 6800.00, "total_wins": 9450.00,
+    "total_wins": 9450.00,
     "member_since": "2026-04-16 08:00:00",
     "bet_stats": { "total": 12, "open": 3, "won": 5, "lost": 3, "void": 1,
-                   "total_stake": 6800.00, "total_payout": 9450.00 }
+                   "total_payout": 9450.00 }
   }
 }
 ```
@@ -535,11 +537,32 @@ curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: applicati
 ```
 
 ### Settle (permanent)
+Pays winners (`possible_win` → balance), marks losers (stake kept by house), unlocks every affected user's `locked_balance`, updates `total_wins`, writes a `bet_won` / `bet_lost` ledger row per bet with **accurate balance_before/balance_after** snapshots, fires an SMS to every real-money winner, and writes an audit row with totals.
+
 ```bash
 curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
   -d '{ "market_id": "a1b2c3d4e5f67890", "winning_outcome_id": 5 }' \
   "https://yourdomain.com/api.php?route=admin_settle_market"
 ```
+```json
+{
+  "success": true,
+  "message": "Market settled",
+  "data": {
+    "market_id": "a1b2c3d4e5f67890",
+    "status": "resolved",
+    "winning_outcome": { "outcome_id": 5, "name": "Yes" },
+    "winners_count": 14,
+    "losers_count": 24,
+    "bets_settled": 38,
+    "total_payout": 10850.00,
+    "total_payout_real": 10100.00,
+    "total_payout_bonus": 750.00,
+    "resolved_at": "2026-05-23 10:30:00"
+  }
+}
+```
+Concurrency: market and all affected user rows are locked `FOR UPDATE`. A double-call from two admin sessions hits the `resolved/voided` check and returns `409` on the second call.
 
 ### Void market (full refund, permanent)
 ```bash
@@ -751,21 +774,106 @@ curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: applicati
 ```
 `type` is one of `deposit / bonus / withdrawal / adjustment`. Magnitude ≤ 10,000,000. Cannot pull balance below zero.
 
-### Pending withdrawals
+### Pending withdrawals (full user vetting block)
+Every pending withdrawal returns a complete `user` block: identity, KYC flags, balance breakdown, lifetime stats, deposit/withdrawal history, ban history, recent bets, and any other pending withdrawals from the same user — everything an admin needs to make an informed approve/reject decision.
+
 ```bash
 curl -H "Authorization: Bearer $ADMIN_TOKEN" \
   "https://yourdomain.com/api.php?route=admin_pending_withdrawals&page=1&limit=20"
 ```
 
-### Approve / reject withdrawal
+```json
+{
+  "success": true,
+  "data": [
+    {
+      "withdrawal_id": 5,
+      "amount": 1500.00,
+      "phone": "+254712345678",
+      "status": "pending",
+      "requested_at": "2026-05-23 10:14:00",
+      "user": {
+        "user_id": 5,
+        "username": "charles",
+        "email": "charles@example.com",
+        "phone": "+254712345678",
+        "full_name": "Charles N.",
+        "role": "user",
+        "verified": true,
+        "email_verified": true,
+        "phone_verified": true,
+        "is_suspended": false,
+        "messaging_restricted": false,
+        "balance": 1800.00,
+        "locked_balance": 1500.00,
+        "available_balance": 300.00,
+        "bonus_balance": 50.00,
+        "total_wagered": 6800.00,
+        "total_wins": 9450.00,
+        "member_since": "2026-04-16 08:00:00",
+        "bet_stats":         { "total": 12, "open": 3, "won": 5, "lost": 3, "void": 1, "total_stake": 6800.00, "total_payout": 9450.00 },
+        "deposit_stats":     { "total": 8, "completed": 7, "total_completed": 12000.00, "last_deposit": "2026-05-20 15:11:00" },
+        "withdrawal_stats":  { "total": 4, "completed": 2, "pending": 1, "rejected": 1, "total_completed": 3500.00, "last_withdrawal": "2026-05-18 09:02:00" },
+        "net_position": 8500.00,
+        "ban_history": [],
+        "recent_bets": [
+          { "slip_id": "BET_A1B2C3D4", "market_id": 12, "stake": 500.00, "status": "open", "created_at": "2026-05-22 18:30:00" }
+        ],
+        "pending_withdrawals": [
+          { "id": 5, "amount": 1500.00, "phone": "+254712345678", "status": "pending", "created_at": "2026-05-23 10:14:00" }
+        ]
+      }
+    }
+  ],
+  "meta": { "total": 1, "page": 1, "limit": 20, "pages": 1 }
+}
+```
+
+### Approve withdrawal
+The response includes the same full `user` vetting block, plus the B2C disbursement result.
 ```bash
 curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
-  -d '{ "withdrawal_id": 5, "note": "Approved" }' \
+  -d '{ "withdrawal_id": 5, "note": "Verified KYC" }' \
   "https://yourdomain.com/api.php?route=admin_approve_withdrawal"
+```
+```json
+{
+  "success": true,
+  "message": "Withdrawal approved",
+  "data": {
+    "withdrawal_id": 5,
+    "status": "completed",
+    "amount": 1500.00,
+    "phone": "+254712345678",
+    "approved_at": "2026-05-23 10:20:00",
+    "note": "Verified KYC",
+    "b2c": { "ok": true, "conversation_id": "AG_20260523_..." },
+    "user": { "user_id": 5, "username": "charles", "balance": 300.00, "...": "(full vetting block)" }
+  }
+}
+```
 
+### Reject withdrawal
+Same full user block, with the rejection reason recorded and the locked balance unlocked.
+```bash
 curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
-  -d '{ "withdrawal_id": 5, "reason": "Suspicious activity" }' \
+  -d '{ "withdrawal_id": 5, "reason": "Phone number mismatch — please contact support" }' \
   "https://yourdomain.com/api.php?route=admin_reject_withdrawal"
+```
+```json
+{
+  "success": true,
+  "message": "Withdrawal rejected",
+  "data": {
+    "withdrawal_id": 5,
+    "status": "rejected",
+    "amount": 1500.00,
+    "phone": "+254712345678",
+    "reason": "Phone number mismatch — please contact support",
+    "rejected_at": "2026-05-23 10:20:00",
+    "user": { "user_id": 5, "username": "charles", "balance": 1800.00, "...": "(full vetting block)" }
+  }
+}
 ```
 
 ### Payment report

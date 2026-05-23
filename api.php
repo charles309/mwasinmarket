@@ -655,7 +655,6 @@ function handle_profile(): void {
         'locked_balance'       => (float)$user['locked_balance'],
         'available_balance'    => (float)$user['balance'] - (float)$user['locked_balance'],
         'bonus_balance'        => (float)$user['bonus_balance'],
-        'total_wagered'        => (float)$user['total_wagered'],
         'total_wins'           => (float)$user['total_wins'],
         'member_since'         => $user['created_at'],
         'bet_stats' => [
@@ -664,7 +663,6 @@ function handle_profile(): void {
             'won'           => (int)$bs['won_bets'],
             'lost'          => (int)$bs['lost_bets'],
             'void'          => (int)$bs['void_bets'],
-            'total_stake'   => (float)$bs['total_stake'],
             'total_payout'  => (float)$bs['total_payout'],
         ],
     ]);
@@ -1682,107 +1680,142 @@ function handle_admin_settle_market(array $body): void {
         $m = _admin_market_lock($pdo, $mid);
         if (in_array($m['status'], ['resolved', 'voided'], true)) { $pdo->rollBack(); fail('Market is already in terminal state.', 409); }
 
-        // Validate winning outcome
         $owin = $pdo->prepare("SELECT id, name FROM outcomes WHERE id = :oid AND market_id = :mid LIMIT 1");
         $owin->execute([':oid' => $winOid, ':mid' => $m['id']]);
         $winRow = $owin->fetch();
         if (!$winRow) { $pdo->rollBack(); fail('Winning outcome does not belong to this market.', 422); }
 
-        // Winners: open bets on winning outcome
         $wstmt = $pdo->prepare("SELECT id, user_id, stake, possible_win, is_bonus_bet FROM bets WHERE market_id = :mid AND status = 'open' AND outcome_id = :oid FOR UPDATE");
         $wstmt->execute([':mid' => $m['id'], ':oid' => $winOid]);
         $winners = $wstmt->fetchAll();
 
-        // Losers: open bets on other outcomes
         $lstmt = $pdo->prepare("SELECT id, user_id, stake, is_bonus_bet FROM bets WHERE market_id = :mid AND status = 'open' AND outcome_id != :oid FOR UPDATE");
         $lstmt->execute([':mid' => $m['id'], ':oid' => $winOid]);
         $losers = $lstmt->fetchAll();
 
-        // Batch winners
+        // Group everything by user_id BEFORE running updates, so we know
+        // exactly which users to snapshot for the ledger.
+        $userIds = [];
+        $realCredit = []; $bonusCredit = []; $realUnlock = []; $bonusUnlock = [];
+        $realWinAdd = [];
+        foreach ($winners as $w) {
+            $uid = (int)$w['user_id']; $userIds[$uid] = true;
+            $payout = (float)$w['possible_win']; $stake = (float)$w['stake'];
+            if ((int)$w['is_bonus_bet'] === 1) {
+                $bonusCredit[$uid] = ($bonusCredit[$uid] ?? 0.0) + $payout;
+                $bonusUnlock[$uid] = ($bonusUnlock[$uid] ?? 0.0) + $stake;
+            } else {
+                $realCredit[$uid]  = ($realCredit[$uid]  ?? 0.0) + $payout;
+                $realUnlock[$uid]  = ($realUnlock[$uid]  ?? 0.0) + $stake;
+                $realWinAdd[$uid]  = ($realWinAdd[$uid]  ?? 0.0) + $payout;
+            }
+        }
+        $loserUnlockReal = []; $loserUnlockBonus = [];
+        foreach ($losers as $l) {
+            $uid = (int)$l['user_id']; $userIds[$uid] = true;
+            $stake = (float)$l['stake'];
+            if ((int)$l['is_bonus_bet'] === 1) $loserUnlockBonus[$uid] = ($loserUnlockBonus[$uid] ?? 0.0) + $stake;
+            else                               $loserUnlockReal[$uid]  = ($loserUnlockReal[$uid]  ?? 0.0) + $stake;
+        }
+
+        // Snapshot affected users' balances BEFORE updates (locked rows for accurate before/after)
+        $balBefore = [];
+        if (!empty($userIds)) {
+            $ids = array_keys($userIds);
+            $ph = implode(',', array_fill(0, count($ids), '?'));
+            $snap = $pdo->prepare("SELECT id, balance, bonus_balance FROM users WHERE id IN ({$ph}) FOR UPDATE");
+            $snap->execute($ids);
+            foreach ($snap->fetchAll() as $r) {
+                $balBefore[(int)$r['id']] = ['balance' => (float)$r['balance'], 'bonus_balance' => (float)$r['bonus_balance']];
+            }
+        }
+
+        // Mark winning bets
         if (!empty($winners)) {
             $winIds = array_map(fn($r) => (int)$r['id'], $winners);
             $ph = implode(',', array_fill(0, count($winIds), '?'));
             $upd = $pdo->prepare("UPDATE bets SET status='won', payout=possible_win WHERE id IN ({$ph})");
             $upd->execute($winIds);
 
-            // Group payouts by user_id (real vs bonus)
-            $realPayouts = []; $bonusPayouts = []; $realUnlock = []; $bonusUnlock = [];
-            $realWinAdd = [];
-            foreach ($winners as $w) {
-                $uid = (int)$w['user_id'];
-                $payout = (float)$w['possible_win'];
-                $stake = (float)$w['stake'];
-                if ((int)$w['is_bonus_bet'] === 1) {
-                    $bonusPayouts[$uid] = ($bonusPayouts[$uid] ?? 0.0) + $payout;
-                    $bonusUnlock[$uid]  = ($bonusUnlock[$uid] ?? 0.0) + $stake;
-                } else {
-                    $realPayouts[$uid] = ($realPayouts[$uid] ?? 0.0) + $payout;
-                    $realUnlock[$uid]  = ($realUnlock[$uid] ?? 0.0) + $stake;
-                    $realWinAdd[$uid]  = ($realWinAdd[$uid] ?? 0.0) + $payout;
-                }
-            }
-
             $uReal = $pdo->prepare("UPDATE users SET balance = balance + :add, locked_balance = locked_balance - :unl, total_wins = total_wins + :win, updated_at=NOW() WHERE id = :uid");
-            foreach ($realPayouts as $uid => $payout) {
+            foreach ($realCredit as $uid => $payout) {
                 $uReal->execute([':add' => $payout, ':unl' => $realUnlock[$uid], ':win' => $realWinAdd[$uid], ':uid' => $uid]);
             }
             $uBonus = $pdo->prepare("UPDATE users SET bonus_balance = bonus_balance + :add, locked_balance = locked_balance - :unl, updated_at=NOW() WHERE id = :uid");
-            foreach ($bonusPayouts as $uid => $payout) {
+            foreach ($bonusCredit as $uid => $payout) {
                 $uBonus->execute([':add' => $payout, ':unl' => $bonusUnlock[$uid], ':uid' => $uid]);
             }
         }
 
-        // Batch losers
+        // Mark losing bets
         if (!empty($losers)) {
             $loseIds = array_map(fn($r) => (int)$r['id'], $losers);
             $ph = implode(',', array_fill(0, count($loseIds), '?'));
             $upd = $pdo->prepare("UPDATE bets SET status='lost', payout=0 WHERE id IN ({$ph})");
             $upd->execute($loseIds);
 
-            $unlockReal = []; $unlockBonus = [];
-            foreach ($losers as $l) {
-                $uid = (int)$l['user_id'];
-                $stake = (float)$l['stake'];
-                if ((int)$l['is_bonus_bet'] === 1) {
-                    $unlockBonus[$uid] = ($unlockBonus[$uid] ?? 0.0) + $stake;
-                } else {
-                    $unlockReal[$uid] = ($unlockReal[$uid] ?? 0.0) + $stake;
-                }
-            }
             $uUnlock = $pdo->prepare("UPDATE users SET locked_balance = locked_balance - :unl, updated_at=NOW() WHERE id = :uid");
-            foreach ($unlockReal as $uid => $unl) $uUnlock->execute([':unl' => $unl, ':uid' => $uid]);
-            foreach ($unlockBonus as $uid => $unl) $uUnlock->execute([':unl' => $unl, ':uid' => $uid]);
+            foreach ($loserUnlockReal as $uid => $unl)  $uUnlock->execute([':unl' => $unl, ':uid' => $uid]);
+            foreach ($loserUnlockBonus as $uid => $unl) $uUnlock->execute([':unl' => $unl, ':uid' => $uid]);
         }
 
         $mUpd = $pdo->prepare("UPDATE markets SET status='resolved', resolve_time=NOW(), updated_at=NOW() WHERE id=:id");
         $mUpd->execute([':id' => $m['id']]);
 
+        // Phone lookup for SMS notifications (post-commit)
+        $phoneMap = [];
+        if (!empty($winners)) {
+            $winUserIds = array_unique(array_map(fn($w) => (int)$w['user_id'], $winners));
+            $ph = implode(',', array_fill(0, count($winUserIds), '?'));
+            $ps = $pdo->prepare("SELECT id, phone FROM users WHERE id IN ({$ph})");
+            $ps->execute($winUserIds);
+            foreach ($ps->fetchAll() as $r) $phoneMap[(int)$r['id']] = (string)$r['phone'];
+        }
+
         $pdo->commit();
 
-        // Post-commit: balance_transactions for each affected user
-        if (!empty($winners)) {
-            foreach ($winners as $w) {
-                record_balance_tx((int)$w['user_id'], 'bet_won', (float)$w['possible_win'], 0.0, 0.0, null, (int)$m['id'], 'Won bet on ' . $winRow['name']);
+        // POST-COMMIT: ledger with accurate before/after, plus winner SMS
+        $totalRealPaid = 0.0; $totalBonusPaid = 0.0;
+        foreach ($realCredit as $uid => $payout) {
+            $bb = $balBefore[$uid]['balance'] ?? 0.0;
+            $ba = $bb + $payout;  // balance increase from real wins
+            record_balance_tx($uid, 'bet_won', $payout, $bb, $ba, null, (int)$m['id'], 'Won real bet on ' . $winRow['name']);
+            $totalRealPaid += $payout;
+            if (!empty($phoneMap[$uid])) {
+                send_sms_now($phoneMap[$uid], "You won KES " . number_format($payout, 2) . " on '{$winRow['name']}'. Balance credited.", $uid, null);
             }
         }
-        if (!empty($losers)) {
-            foreach ($losers as $l) {
-                record_balance_tx((int)$l['user_id'], 'bet_lost', 0.0, 0.0, 0.0, null, (int)$m['id'], 'Lost bet (market settled)');
-            }
+        foreach ($bonusCredit as $uid => $payout) {
+            $bb = $balBefore[$uid]['bonus_balance'] ?? 0.0;
+            $ba = $bb + $payout;
+            record_balance_tx($uid, 'bet_won', $payout, $bb, $ba, null, (int)$m['id'], 'Won bonus bet on ' . $winRow['name']);
+            $totalBonusPaid += $payout;
         }
+        foreach ($losers as $l) {
+            $uid = (int)$l['user_id'];
+            record_balance_tx($uid, 'bet_lost', 0.0, 0.0, 0.0, null, (int)$m['id'], 'Lost bet (market settled)');
+        }
+
         audit_log('settle_market', (int)$admin['user_id'], 'market', (int)$m['id'], [
             'winning_outcome_id' => $winOid,
             'winning_outcome_name' => $winRow['name'],
-            'winners_count' => count($winners),
-            'losers_count'  => count($losers),
+            'winners_count'  => count($winners),
+            'losers_count'   => count($losers),
+            'total_paid_real'  => round($totalRealPaid, 2),
+            'total_paid_bonus' => round($totalBonusPaid, 2),
         ]);
 
         ok([
-            'market_id'        => $mid,
-            'status'           => 'resolved',
-            'winning_outcome'  => ['outcome_id' => $winOid, 'name' => $winRow['name']],
-            'winners_count'    => count($winners),
-            'losers_count'     => count($losers),
+            'market_id'       => $mid,
+            'status'          => 'resolved',
+            'winning_outcome' => ['outcome_id' => $winOid, 'name' => $winRow['name']],
+            'winners_count'   => count($winners),
+            'losers_count'    => count($losers),
+            'bets_settled'    => count($winners) + count($losers),
+            'total_payout'    => round($totalRealPaid + $totalBonusPaid, 2),
+            'total_payout_real'  => round($totalRealPaid, 2),
+            'total_payout_bonus' => round($totalBonusPaid, 2),
+            'resolved_at'     => gmdate('Y-m-d H:i:s'),
         ], 'Market settled');
     } catch (Throwable $e) {
         if ($pdo->inTransaction()) $pdo->rollBack();
@@ -3055,6 +3088,110 @@ function handle_admin_credit_user(array $body): void {
     }
 }
 
+/**
+ * Build a full vetting profile for a user — every field an admin needs
+ * to make an informed approve/reject decision on a withdrawal.
+ */
+function _admin_user_vetting(int $userId): ?array {
+    $pdo = db();
+    $u = $pdo->prepare("SELECT id, username, email, phone, full_name, role, balance, locked_balance, bonus_balance, total_wagered, total_wins, verified, email_verified, phone_verified, is_suspended, messaging_restricted, created_at FROM users WHERE id = :id LIMIT 1");
+    $u->execute([':id' => $userId]);
+    $user = $u->fetch();
+    if (!$user) return null;
+
+    $bets = $pdo->prepare("SELECT
+        COUNT(*) AS total,
+        SUM(CASE WHEN status='open' THEN 1 ELSE 0 END) AS open,
+        SUM(CASE WHEN status='won'  THEN 1 ELSE 0 END) AS won,
+        SUM(CASE WHEN status='lost' THEN 1 ELSE 0 END) AS lost,
+        SUM(CASE WHEN status='void' THEN 1 ELSE 0 END) AS void,
+        COALESCE(SUM(stake),0) AS total_stake,
+        COALESCE(SUM(CASE WHEN status='won' THEN payout ELSE 0 END),0) AS total_payout
+        FROM bets WHERE user_id = :id");
+    $bets->execute([':id' => $userId]);
+    $bs = $bets->fetch();
+
+    $dep = $pdo->prepare("SELECT
+        COUNT(*) AS total,
+        SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS completed,
+        COALESCE(SUM(CASE WHEN status='completed' THEN amount ELSE 0 END),0) AS total_completed,
+        MAX(CASE WHEN status='completed' THEN completed_at ELSE NULL END) AS last_at
+        FROM deposits WHERE user_id = :id");
+    $dep->execute([':id' => $userId]);
+    $depRow = $dep->fetch();
+
+    $wd = $pdo->prepare("SELECT
+        COUNT(*) AS total,
+        SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS completed,
+        SUM(CASE WHEN status='pending'   THEN 1 ELSE 0 END) AS pending,
+        SUM(CASE WHEN status='rejected'  THEN 1 ELSE 0 END) AS rejected,
+        COALESCE(SUM(CASE WHEN status='completed' THEN amount ELSE 0 END),0) AS total_completed,
+        MAX(CASE WHEN status='completed' THEN completed_at ELSE NULL END) AS last_at
+        FROM withdrawals WHERE user_id = :id");
+    $wd->execute([':id' => $userId]);
+    $wdRow = $wd->fetch();
+
+    $bans = $pdo->prepare("SELECT id, reason, banned_at, lifted_at FROM user_bans WHERE user_id = :id ORDER BY banned_at DESC LIMIT 5");
+    $bans->execute([':id' => $userId]);
+    $banHistory = $bans->fetchAll();
+
+    $lastBets = $pdo->prepare("SELECT slip_id, market_id, stake, status, created_at FROM bets WHERE user_id = :id ORDER BY created_at DESC LIMIT 5");
+    $lastBets->execute([':id' => $userId]);
+    $recentBets = $lastBets->fetchAll();
+
+    $pendingW = $pdo->prepare("SELECT id, amount, phone, status, created_at FROM withdrawals WHERE user_id = :id AND status IN ('pending','processing','approved') ORDER BY created_at DESC");
+    $pendingW->execute([':id' => $userId]);
+    $pendingWithdrawals = $pendingW->fetchAll();
+
+    return [
+        'user_id'              => (int)$user['id'],
+        'username'             => $user['username'],
+        'email'                => $user['email'],
+        'phone'                => $user['phone'],
+        'full_name'            => $user['full_name'],
+        'role'                 => $user['role'],
+        'verified'             => (bool)$user['verified'],
+        'email_verified'       => (bool)$user['email_verified'],
+        'phone_verified'       => (bool)$user['phone_verified'],
+        'is_suspended'         => (bool)$user['is_suspended'],
+        'messaging_restricted' => (bool)$user['messaging_restricted'],
+        'balance'              => (float)$user['balance'],
+        'locked_balance'       => (float)$user['locked_balance'],
+        'available_balance'    => (float)$user['balance'] - (float)$user['locked_balance'],
+        'bonus_balance'        => (float)$user['bonus_balance'],
+        'total_wagered'        => (float)$user['total_wagered'],
+        'total_wins'           => (float)$user['total_wins'],
+        'member_since'         => $user['created_at'],
+        'bet_stats' => [
+            'total'         => (int)$bs['total'],
+            'open'          => (int)$bs['open'],
+            'won'           => (int)$bs['won'],
+            'lost'          => (int)$bs['lost'],
+            'void'          => (int)$bs['void'],
+            'total_stake'   => (float)$bs['total_stake'],
+            'total_payout'  => (float)$bs['total_payout'],
+        ],
+        'deposit_stats' => [
+            'total'           => (int)$depRow['total'],
+            'completed'       => (int)$depRow['completed'],
+            'total_completed' => (float)$depRow['total_completed'],
+            'last_deposit'    => $depRow['last_at'],
+        ],
+        'withdrawal_stats' => [
+            'total'           => (int)$wdRow['total'],
+            'completed'       => (int)$wdRow['completed'],
+            'pending'         => (int)$wdRow['pending'],
+            'rejected'        => (int)$wdRow['rejected'],
+            'total_completed' => (float)$wdRow['total_completed'],
+            'last_withdrawal' => $wdRow['last_at'],
+        ],
+        'net_position'        => round((float)$depRow['total_completed'] - (float)$wdRow['total_completed'], 2),
+        'ban_history'         => $banHistory,
+        'recent_bets'         => $recentBets,
+        'pending_withdrawals' => $pendingWithdrawals,
+    ];
+}
+
 function handle_admin_pending_withdrawals(): void {
     require_admin();
     $page  = max(1, (int)($_GET['page'] ?? 1));
@@ -3064,10 +3201,9 @@ function handle_admin_pending_withdrawals(): void {
     $count = (int)db()->query("SELECT COUNT(*) c FROM withdrawals WHERE status = 'pending'")->fetch()['c'];
 
     $stmt = db()->prepare("
-        SELECT w.id, w.amount, w.phone, w.status, w.created_at,
-               u.id AS user_id, u.username, u.balance, u.locked_balance, u.is_suspended
+        SELECT w.id AS withdrawal_id, w.amount, w.phone, w.status, w.created_at AS requested_at,
+               w.user_id
         FROM withdrawals w
-        JOIN users u ON u.id = w.user_id
         WHERE w.status = 'pending'
         ORDER BY w.created_at ASC
         LIMIT :lim OFFSET :off
@@ -3077,9 +3213,22 @@ function handle_admin_pending_withdrawals(): void {
     $stmt->execute();
     $rows = $stmt->fetchAll();
 
+    $items = [];
+    foreach ($rows as $r) {
+        $userProfile = _admin_user_vetting((int)$r['user_id']);
+        $items[] = [
+            'withdrawal_id' => (int)$r['withdrawal_id'],
+            'amount'        => (float)$r['amount'],
+            'phone'         => $r['phone'],
+            'status'        => $r['status'],
+            'requested_at'  => $r['requested_at'],
+            'user'          => $userProfile,
+        ];
+    }
+
     ok([
-        'data' => $rows,
-        'meta' => ['total' => $count, 'page' => $page, 'limit' => $limit, 'pages' => (int)ceil($count / $limit)],
+        'data' => $items,
+        'meta' => ['total' => $count, 'page' => $page, 'limit' => $limit, 'pages' => (int)ceil(max(1, $count) / $limit)],
     ]);
 }
 
@@ -3134,7 +3283,11 @@ function handle_admin_approve_withdrawal(array $body): void {
             'withdrawal_id' => $wid,
             'status'        => $status,
             'amount'        => $amount,
+            'phone'         => $w['phone'],
+            'approved_at'   => gmdate('Y-m-d H:i:s'),
+            'note'          => $note,
             'b2c'           => $b2c,
+            'user'          => _admin_user_vetting($userId),
         ], 'Withdrawal approved');
     } catch (Throwable $e) {
         if ($pdo->inTransaction()) $pdo->rollBack();
@@ -3176,7 +3329,10 @@ function handle_admin_reject_withdrawal(array $body): void {
             'withdrawal_id' => $wid,
             'status'        => 'rejected',
             'amount'        => $amount,
+            'phone'         => $w['phone'],
             'reason'        => $reason,
+            'rejected_at'   => gmdate('Y-m-d H:i:s'),
+            'user'          => _admin_user_vetting($userId),
         ], 'Withdrawal rejected');
     } catch (Throwable $e) {
         if ($pdo->inTransaction()) $pdo->rollBack();
