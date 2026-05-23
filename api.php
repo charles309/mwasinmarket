@@ -119,13 +119,15 @@ function fail(string $error, int $status = 400, array $details = []): never {
 }
 
 function internal_error(Throwable $e, string $context = ''): never {
+    $rid = $GLOBALS['REQUEST_ID'] ?? '-';
     $logEntry = json_encode([
-        'time'    => gmdate('Y-m-d H:i:s'),
-        'context' => $context,
-        'class'   => get_class($e),
-        'message' => $e->getMessage(),
-        'file'    => $e->getFile(),
-        'line'    => $e->getLine(),
+        'time'       => gmdate('Y-m-d H:i:s'),
+        'request_id' => $rid,
+        'context'    => $context,
+        'class'      => get_class($e),
+        'message'    => $e->getMessage(),
+        'file'       => $e->getFile(),
+        'line'       => $e->getLine(),
     ], JSON_UNESCAPED_UNICODE);
     error_log('[MwasinMarket][ERROR] ' . $logEntry);
     http_response_code(500);
@@ -524,73 +526,84 @@ function handle_register(array $body): void {
     ], 'Registration successful', 201);
 }
 
+function _login_identifier(array $body): string {
+    foreach (['identifier', 'username', 'email', 'phone'] as $k) {
+        if (isset($body[$k]) && is_string($body[$k]) && trim($body[$k]) !== '') return trim($body[$k]);
+    }
+    return '';
+}
+
 function handle_login(array $body): void {
     check_rate_limit(10, 900);
-    require_fields($body, ['identifier', 'password']);
-    $identifier = is_string($body['identifier']) ? trim($body['identifier']) : '';
-    $password   = is_string($body['password']) ? $body['password'] : '';
+    if (!isset($body['password']) || !is_string($body['password'])) {
+        fail('Missing required fields: password', 422, ['password']);
+    }
+    $password = (string)$body['password'];
+    $identifier = _login_identifier($body);
     if ($identifier === '' || $password === '') fail('Invalid credentials.', 401);
 
-    $stmt = db()->prepare("SELECT id, username, password_hash, role, is_suspended FROM users WHERE (username = :id OR email = :id OR phone = :id) LIMIT 1");
+    $stmt = db()->prepare("SELECT id, username, email, phone, role, balance, locked_balance, bonus_balance, password_hash, is_suspended FROM users WHERE (username = :id OR email = :id OR phone = :id) LIMIT 1");
     $stmt->execute([':id' => $identifier]);
     $user = $stmt->fetch();
 
-    if (!$user) {
-        password_verify($password, DUMMY_HASH); // timing
-        fail('Invalid credentials.', 401);
-    }
-    if (!password_verify($password, (string)$user['password_hash'])) {
-        fail('Invalid credentials.', 401);
-    }
-    if ((int)$user['is_suspended'] === 1) {
-        fail('Your account has been suspended.', 403);
-    }
+    if (!$user) { password_verify($password, DUMMY_HASH); fail('Invalid credentials.', 401); }
+    if (!password_verify($password, (string)$user['password_hash'])) fail('Invalid credentials.', 401);
+    if ((int)$user['is_suspended'] === 1) fail('Your account has been suspended.', 403);
+
     clear_rate_limit_attempt();
     cleanup_expired_tokens((int)$user['id']);
     $token = issue_token((int)$user['id']);
+    $exp = time() + TOKEN_TTL;
     ok([
-        'user_id'  => (int)$user['id'],
-        'username' => $user['username'],
-        'role'     => $user['role'],
-        'token'    => $token,
-        'expires_in' => TOKEN_TTL,
+        'user_id'        => (int)$user['id'],
+        'username'       => $user['username'],
+        'email'          => $user['email'],
+        'phone'          => $user['phone'],
+        'role'           => $user['role'],
+        'balance'        => (float)$user['balance'],
+        'locked_balance' => (float)$user['locked_balance'],
+        'bonus_balance'  => (float)$user['bonus_balance'],
+        'token'          => $token,
+        'expires_in'     => TOKEN_TTL,
+        'expires_at'     => gmdate('Y-m-d H:i:s', $exp),
     ], 'Login successful');
 }
 
 function handle_admin_login(array $body): void {
     check_rate_limit(10, 900);
-    require_fields($body, ['identifier', 'password']);
-    $identifier = is_string($body['identifier']) ? trim($body['identifier']) : '';
-    $password   = is_string($body['password']) ? $body['password'] : '';
+    if (!isset($body['password']) || !is_string($body['password'])) {
+        fail('Missing required fields: password', 422, ['password']);
+    }
+    $password = (string)$body['password'];
+    $identifier = _login_identifier($body);
     if ($identifier === '' || $password === '') fail('Invalid credentials.', 401);
 
-    $stmt = db()->prepare("SELECT id, username, password_hash, role, is_suspended FROM users WHERE (username = :id OR email = :id OR phone = :id) LIMIT 1");
+    $stmt = db()->prepare("SELECT id, username, email, phone, role, balance, locked_balance, bonus_balance, password_hash, is_suspended FROM users WHERE (username = :id OR email = :id OR phone = :id) LIMIT 1");
     $stmt->execute([':id' => $identifier]);
     $user = $stmt->fetch();
 
-    if (!$user) {
-        password_verify($password, DUMMY_HASH);
-        fail('Invalid credentials.', 401);
-    }
-    if (!password_verify($password, (string)$user['password_hash'])) {
-        fail('Invalid credentials.', 401);
-    }
-    if ($user['role'] !== 'admin') {
-        fail('Admin access required.', 403);
-    }
-    if ((int)$user['is_suspended'] === 1) {
-        fail('Your account has been suspended.', 403);
-    }
+    if (!$user) { password_verify($password, DUMMY_HASH); fail('Invalid credentials.', 401); }
+    if (!password_verify($password, (string)$user['password_hash'])) fail('Invalid credentials.', 401);
+    if ($user['role'] !== 'admin') fail('Admin access required.', 403);
+    if ((int)$user['is_suspended'] === 1) fail('Your account has been suspended.', 403);
+
     clear_rate_limit_attempt();
     cleanup_expired_tokens((int)$user['id']);
     $token = issue_token((int)$user['id']);
+    $exp = time() + TOKEN_TTL;
     audit_log('admin_login', (int)$user['id'], 'user', (int)$user['id'], ['ip' => client_ip()]);
     ok([
-        'user_id'  => (int)$user['id'],
-        'username' => $user['username'],
-        'role'     => 'admin',
-        'token'    => $token,
-        'expires_in' => TOKEN_TTL,
+        'user_id'        => (int)$user['id'],
+        'username'       => $user['username'],
+        'email'          => $user['email'],
+        'phone'          => $user['phone'],
+        'role'           => 'admin',
+        'balance'        => (float)$user['balance'],
+        'locked_balance' => (float)$user['locked_balance'],
+        'bonus_balance'  => (float)$user['bonus_balance'],
+        'token'          => $token,
+        'expires_in'     => TOKEN_TTL,
+        'expires_at'     => gmdate('Y-m-d H:i:s', $exp),
     ], 'Admin login successful');
 }
 
@@ -627,32 +640,30 @@ function handle_profile(): void {
     $bs = $stats->fetch();
 
     ok([
-        'user' => [
-            'id'                   => (int)$user['id'],
-            'username'             => $user['username'],
-            'email'                => $user['email'],
-            'phone'                => $user['phone'],
-            'full_name'            => $user['full_name'],
-            'role'                 => $user['role'],
-            'balance'              => (float)$user['balance'],
-            'locked_balance'       => (float)$user['locked_balance'],
-            'available_balance'    => (float)$user['balance'] - (float)$user['locked_balance'],
-            'bonus_balance'        => (float)$user['bonus_balance'],
-            'total_wagered'        => (float)$user['total_wagered'],
-            'total_wins'           => (float)$user['total_wins'],
-            'verified'             => (bool)$user['verified'],
-            'email_verified'       => (bool)$user['email_verified'],
-            'phone_verified'       => (bool)$user['phone_verified'],
-            'is_suspended'         => (bool)$user['is_suspended'],
-            'messaging_restricted' => (bool)$user['messaging_restricted'],
-            'created_at'           => $user['created_at'],
-        ],
+        'user_id'              => (int)$user['id'],
+        'username'             => $user['username'],
+        'email'                => $user['email'],
+        'phone'                => $user['phone'],
+        'full_name'            => $user['full_name'],
+        'role'                 => $user['role'],
+        'verified'             => (bool)$user['verified'],
+        'email_verified'       => (bool)$user['email_verified'],
+        'phone_verified'       => (bool)$user['phone_verified'],
+        'is_suspended'         => (bool)$user['is_suspended'],
+        'messaging_restricted' => (bool)$user['messaging_restricted'],
+        'balance'              => (float)$user['balance'],
+        'locked_balance'       => (float)$user['locked_balance'],
+        'available_balance'    => (float)$user['balance'] - (float)$user['locked_balance'],
+        'bonus_balance'        => (float)$user['bonus_balance'],
+        'total_wagered'        => (float)$user['total_wagered'],
+        'total_wins'           => (float)$user['total_wins'],
+        'member_since'         => $user['created_at'],
         'bet_stats' => [
-            'total_bets'    => (int)$bs['total_bets'],
-            'open_bets'     => (int)$bs['open_bets'],
-            'won_bets'      => (int)$bs['won_bets'],
-            'lost_bets'     => (int)$bs['lost_bets'],
-            'void_bets'     => (int)$bs['void_bets'],
+            'total'         => (int)$bs['total_bets'],
+            'open'          => (int)$bs['open_bets'],
+            'won'           => (int)$bs['won_bets'],
+            'lost'          => (int)$bs['lost_bets'],
+            'void'          => (int)$bs['void_bets'],
             'total_stake'   => (float)$bs['total_stake'],
             'total_payout'  => (float)$bs['total_payout'],
         ],
@@ -711,16 +722,19 @@ function handle_my_bets(): void {
             'question'      => $r['question'],
             'market_status' => $r['market_status'],
             'outcome_id'    => (int)$r['outcome_id'],
+            'outcome'       => $r['outcome_name'],
             'outcome_name'  => $r['outcome_name'],
             'is_bonus_bet'  => (bool)$r['is_bonus_bet'],
             'shares'        => (float)$r['shares'],
             'stake'         => (float)$r['stake'],
+            'odds'          => (float)$r['odds_at_entry'],
             'odds_at_entry' => (float)$r['odds_at_entry'],
             'possible_win'  => (float)$r['possible_win'],
             'payout'        => $r['payout'] === null ? null : (float)$r['payout'],
             'status'        => $r['status'],
             'void_reason'   => $r['void_reason'],
             'expires_at'    => $r['expires_at'],
+            'placed_at'     => $r['created_at'],
             'created_at'    => $r['created_at'],
         ];
     }
@@ -963,11 +977,12 @@ function fetch_market_outcomes(int $marketId): array {
 
 function public_market_row(array $m, array $outcomes): array {
     return [
+        'id'                => 'pm_' . $m['market_id'],
         'market_id'         => $m['market_id'],
+        'source'            => $m['source'] ?: 'local',
         'question'          => $m['question'],
         'title'             => $m['title'],
         'image_url'         => $m['image_url'],
-        'source'            => $m['source'],
         'category'          => $m['category'],
         'market_type'       => $m['market_type'],
         'status'            => $m['status'],
@@ -1119,7 +1134,7 @@ function handle_market_single(): void {
 
 function handle_market_history(): void {
     $mid = validate_market_id($_GET['market_id'] ?? '');
-    $limit = min(500, max(10, (int)($_GET['limit'] ?? 100)));
+    $limit = min(500, max(10, (int)($_GET['limit'] ?? 200)));
     $outcomeFilter = isset($_GET['outcome_id']) ? strict_positive_int($_GET['outcome_id'], 'outcome_id') : 0;
 
     $mstmt = db()->prepare("SELECT id FROM markets WHERE market_id = :mid LIMIT 1");
@@ -1127,7 +1142,13 @@ function handle_market_history(): void {
     $m = $mstmt->fetch();
     if (!$m) fail('Market not found.', 404);
 
-    $sql = "SELECT outcome_id, probability, odds, volume, created_at FROM market_snapshots WHERE market_id = :mid";
+    // Outcome names lookup
+    $ostmt = db()->prepare("SELECT id, name FROM outcomes WHERE market_id = :mid");
+    $ostmt->execute([':mid' => $m['id']]);
+    $names = [];
+    foreach ($ostmt->fetchAll() as $o) $names[(int)$o['id']] = $o['name'];
+
+    $sql = "SELECT outcome_id, odds, volume, created_at FROM market_snapshots WHERE market_id = :mid";
     $params = [':mid' => (int)$m['id']];
     if ($outcomeFilter > 0) {
         $sql .= " AND outcome_id = :oid";
@@ -1140,21 +1161,30 @@ function handle_market_history(): void {
     $stmt->execute();
     $rows = array_reverse($stmt->fetchAll());
 
-    $series = [];
+    $grouped = [];
     foreach ($rows as $r) {
-        $series[] = [
-            'outcome_id' => (int)$r['outcome_id'],
-            'probability'=> (float)$r['probability'],
-            'odds'       => (float)$r['odds'],
-            'volume'     => (float)$r['volume'],
-            'time'       => $r['created_at'],
+        $oid = (int)$r['outcome_id'];
+        if (!isset($grouped[$oid])) $grouped[$oid] = [];
+        $grouped[$oid][] = [
+            'time'   => $r['created_at'],
+            'odds'   => (float)$r['odds'],
+            'volume' => (float)$r['volume'],
+        ];
+    }
+
+    $outcomes = [];
+    foreach ($grouped as $oid => $series) {
+        $outcomes[] = [
+            'outcome_id'   => $oid,
+            'outcome_name' => $names[$oid] ?? null,
+            'series'       => $series,
         ];
     }
 
     ok([
         'market_id' => $mid,
-        'history'   => $series,
-        'count'     => count($series),
+        'outcomes'  => $outcomes,
+        'count'     => count($rows),
     ]);
 }
 
@@ -2184,10 +2214,20 @@ function handle_admin_reseed_odds(array $body): void {
             fail('You must provide odds for every existing outcome (' . count($existing) . ').', 422, ['outcomes']);
         }
         $implied = 0.0;
-        foreach ($body['outcomes'] as $i => $o) {
+        // Build a name→id lookup so callers can identify outcomes by either field.
+        $nameToId = [];
+        foreach ($existing as $ex) $nameToId[mb_strtolower($ex['name'])] = (int)$ex['id'];
+
+        foreach ($body['outcomes'] as $i => &$o) {
             if (!is_array($o)) fail("outcomes[{$i}] must be an object.", 422, ['outcomes']);
-            if (!isset($o['outcome_id'])) fail("outcomes[{$i}].outcome_id required.", 422, ['outcomes']);
+            if (!isset($o['outcome_id']) && isset($o['name']) && is_string($o['name'])) {
+                $key = mb_strtolower(trim($o['name']));
+                if (!isset($nameToId[$key])) fail("outcomes[{$i}] name '{$o['name']}' not found in this market.", 422, ['outcomes']);
+                $o['outcome_id'] = $nameToId[$key];
+            }
+            if (!isset($o['outcome_id'])) fail("outcomes[{$i}].outcome_id or name required.", 422, ['outcomes']);
             $oid = strict_positive_int($o['outcome_id'], "outcomes[{$i}].outcome_id");
+            $o['outcome_id'] = $oid;
             if ((int)$existing[$i]['id'] !== $oid) {
                 $found = false;
                 foreach ($existing as $ex) if ((int)$ex['id'] === $oid) { $found = true; break; }
@@ -2197,6 +2237,7 @@ function handle_admin_reseed_odds(array $body): void {
             $odds = strict_positive_amount($o['odds'], "outcomes[{$i}].odds", 1.01, 1000.0);
             $implied += 1.0 / $odds;
         }
+        unset($o);
 
         if ($m['odds_mode'] === 'fixed') {
             if ($implied < FIXED_MIN_OVERROUND) {
@@ -2320,49 +2361,70 @@ function handle_admin_stats(): void {
     require_admin();
     $pdo = db();
 
-    $userStats = $pdo->query("SELECT COUNT(*) AS total_users, SUM(is_suspended) AS suspended, SUM(messaging_restricted) AS restricted FROM users")->fetch();
-    $balanceStats = $pdo->query("SELECT COALESCE(SUM(balance),0) AS total_balance, COALESCE(SUM(locked_balance),0) AS total_locked, COALESCE(SUM(bonus_balance),0) AS total_bonus FROM users")->fetch();
-    $marketStats = $pdo->query("SELECT
-        COUNT(*) AS total_markets,
-        SUM(CASE WHEN status='open'     THEN 1 ELSE 0 END) AS open_markets,
-        SUM(CASE WHEN status='paused'   THEN 1 ELSE 0 END) AS paused_markets,
-        SUM(CASE WHEN status='closed'   THEN 1 ELSE 0 END) AS closed_markets,
-        SUM(CASE WHEN status='resolved' THEN 1 ELSE 0 END) AS resolved_markets,
-        SUM(CASE WHEN status='voided'   THEN 1 ELSE 0 END) AS voided_markets
+    $users = $pdo->query("SELECT
+        COUNT(*) AS total,
+        SUM(CASE WHEN verified = 1 THEN 1 ELSE 0 END) AS verified,
+        SUM(CASE WHEN role = 'admin' THEN 1 ELSE 0 END) AS admins,
+        SUM(CASE WHEN is_suspended = 1 THEN 1 ELSE 0 END) AS suspended,
+        SUM(CASE WHEN created_at >= CURDATE() THEN 1 ELSE 0 END) AS created_today
+        FROM users")->fetch();
+    $active = $pdo->query("SELECT COUNT(DISTINCT user_id) c FROM auth_tokens WHERE created_at >= CURDATE()")->fetch();
+
+    $markets = $pdo->query("SELECT
+        COUNT(*) AS total,
+        SUM(CASE WHEN status='open'     THEN 1 ELSE 0 END) AS open,
+        SUM(CASE WHEN status='paused'   THEN 1 ELSE 0 END) AS paused,
+        SUM(CASE WHEN status='closed'   THEN 1 ELSE 0 END) AS closed,
+        SUM(CASE WHEN status='resolved' THEN 1 ELSE 0 END) AS resolved,
+        SUM(CASE WHEN status='voided'   THEN 1 ELSE 0 END) AS voided,
+        SUM(CASE WHEN created_at >= CURDATE() THEN 1 ELSE 0 END) AS created_today
         FROM markets")->fetch();
-    $betStats = $pdo->query("SELECT
+
+    $fin = $pdo->query("SELECT
         COUNT(*) AS total_bets,
-        SUM(CASE WHEN status='open' THEN 1 ELSE 0 END) AS open_bets,
-        SUM(CASE WHEN status='won'  THEN 1 ELSE 0 END) AS won_bets,
-        SUM(CASE WHEN status='lost' THEN 1 ELSE 0 END) AS lost_bets,
-        SUM(CASE WHEN status='void' THEN 1 ELSE 0 END) AS void_bets,
-        COALESCE(SUM(stake),0) AS total_stake,
-        COALESCE(SUM(CASE WHEN status='won' THEN payout ELSE 0 END),0) AS total_payout
+        COALESCE(SUM(stake),0) AS total_wagered,
+        COALESCE(SUM(CASE WHEN status='won' THEN payout ELSE 0 END),0) AS total_payouts,
+        COALESCE(SUM(CASE WHEN status='void' THEN payout ELSE 0 END),0) AS total_refunds,
+        SUM(CASE WHEN created_at >= CURDATE() THEN 1 ELSE 0 END) AS bets_today,
+        COALESCE(SUM(CASE WHEN created_at >= CURDATE() THEN stake ELSE 0 END),0) AS wagered_today
         FROM bets")->fetch();
-    $depositStats = $pdo->query("SELECT
-        COUNT(*) AS total_deposits,
-        SUM(CASE WHEN status='completed' THEN amount ELSE 0 END) AS total_completed,
-        SUM(CASE WHEN status='pending'   THEN 1 ELSE 0 END) AS pending,
-        SUM(CASE WHEN status='failed'    THEN 1 ELSE 0 END) AS failed
-        FROM deposits")->fetch();
-    $withdrawalStats = $pdo->query("SELECT
-        COUNT(*) AS total_withdrawals,
-        SUM(CASE WHEN status='completed' THEN amount ELSE 0 END) AS total_completed,
-        SUM(CASE WHEN status='pending'   THEN 1 ELSE 0 END) AS pending,
-        SUM(CASE WHEN status='rejected'  THEN 1 ELSE 0 END) AS rejected
-        FROM withdrawals")->fetch();
-    $notifs = $pdo->query("SELECT COUNT(*) c FROM notifications WHERE is_read = 0")->fetch();
-    $smsCount = $pdo->query("SELECT COUNT(*) c FROM sms_log WHERE created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)")->fetch();
+    $houseProfit = (float)$fin['total_wagered'] - (float)$fin['total_payouts'] - (float)$fin['total_refunds'];
+
+    $topBettors = $pdo->query("SELECT u.username, COALESCE(SUM(b.stake),0) AS total_wagered,
+        COALESCE(SUM(CASE WHEN b.status='won' THEN b.payout ELSE 0 END),0) AS total_wins,
+        COUNT(b.id) AS bet_count
+        FROM bets b JOIN users u ON u.id = b.user_id
+        GROUP BY u.id, u.username
+        ORDER BY total_wagered DESC LIMIT 10")->fetchAll();
 
     ok([
-        'users'        => $userStats,
-        'balances'     => $balanceStats,
-        'markets'      => $marketStats,
-        'bets'         => $betStats,
-        'deposits'     => $depositStats,
-        'withdrawals'  => $withdrawalStats,
-        'unread_alerts'=> (int)$notifs['c'],
-        'sms_30d'      => (int)$smsCount['c'],
+        'users' => [
+            'total'         => (int)$users['total'],
+            'verified'      => (int)$users['verified'],
+            'admins'        => (int)$users['admins'],
+            'suspended'     => (int)$users['suspended'],
+            'active_today'  => (int)$active['c'],
+            'created_today' => (int)$users['created_today'],
+        ],
+        'markets' => [
+            'total'         => (int)$markets['total'],
+            'open'          => (int)$markets['open'],
+            'paused'        => (int)$markets['paused'],
+            'closed'        => (int)$markets['closed'],
+            'resolved'      => (int)$markets['resolved'],
+            'voided'        => (int)$markets['voided'],
+            'created_today' => (int)$markets['created_today'],
+        ],
+        'financials' => [
+            'total_bets'    => (int)$fin['total_bets'],
+            'total_wagered' => (float)$fin['total_wagered'],
+            'total_payouts' => (float)$fin['total_payouts'],
+            'total_refunds' => (float)$fin['total_refunds'],
+            'house_profit'  => round($houseProfit, 2),
+            'bets_today'    => (int)$fin['bets_today'],
+            'wagered_today' => (float)$fin['wagered_today'],
+        ],
+        'top_bettors' => $topBettors,
         'generated_at' => gmdate('Y-m-d H:i:s'),
     ]);
 }
@@ -2389,54 +2451,105 @@ function handle_admin_market_report(): void {
     $betSum->execute([':mid' => $m['id']]);
     $bs = $betSum->fetch();
 
-    $volByOutcome = db()->prepare("SELECT outcome_id, COUNT(*) AS bets, COALESCE(SUM(stake),0) AS volume
+    $volByOutcome = db()->prepare("SELECT outcome_id, COUNT(*) AS bets,
+        COALESCE(SUM(stake),0) AS volume,
+        COALESCE(SUM(CASE WHEN status='open' THEN possible_win ELSE 0 END),0) AS open_liability
         FROM bets WHERE market_id = :mid AND status != 'void' GROUP BY outcome_id");
     $volByOutcome->execute([':mid' => $m['id']]);
     $vols = $volByOutcome->fetchAll();
     $volMap = [];
-    foreach ($vols as $v) $volMap[(int)$v['outcome_id']] = ['bets' => (int)$v['bets'], 'volume' => (float)$v['volume']];
+    foreach ($vols as $v) $volMap[(int)$v['outcome_id']] = [
+        'bets' => (int)$v['bets'], 'volume' => (float)$v['volume'], 'open_liability' => (float)$v['open_liability'],
+    ];
 
-    $outcomesWithVol = [];
+    $volumeByOutcome = [];
     foreach ($snap as $s) {
         $oid = (int)$s['outcome_id'];
-        $s['bets'] = $volMap[$oid]['bets'] ?? 0;
-        $s['volume'] = $volMap[$oid]['volume'] ?? 0.0;
-        $outcomesWithVol[] = $s;
+        $volumeByOutcome[] = [
+            'outcome_id'     => $oid,
+            'outcome_name'   => $s['name'],
+            'bet_count'      => $volMap[$oid]['bets'] ?? 0,
+            'total_staked'   => $volMap[$oid]['volume'] ?? 0.0,
+            'open_liability' => $volMap[$oid]['open_liability'] ?? 0.0,
+        ];
     }
 
-    // Graph summary — bulk fetch first/last snapshot per outcome
-    $graphStmt = db()->prepare("SELECT outcome_id,
-        MIN(created_at) AS first_at, MAX(created_at) AS last_at,
-        COUNT(*) AS samples
-        FROM market_snapshots WHERE market_id = :mid GROUP BY outcome_id");
+    // Max liability across all outcomes (worst-case payout if any one outcome wins)
+    $maxLiability = 0.0;
+    foreach ($volumeByOutcome as $v) {
+        if ($v['open_liability'] > $maxLiability) $maxLiability = $v['open_liability'];
+    }
+    $stakeAtRisk = 0.0;
+    foreach ($vols as $v) { if (true) $stakeAtRisk += (float)$v['volume']; }
+    $houseProfit = (float)$bs['total_stake'] - (float)$bs['total_payout'];
+
+    $graphStmt = db()->prepare("SELECT s.outcome_id, o.name AS outcome_name,
+        MIN(s.created_at) AS first_at, MAX(s.created_at) AS last_at,
+        COUNT(*) AS samples,
+        SUBSTRING_INDEX(GROUP_CONCAT(s.odds ORDER BY s.created_at ASC),  ',', 1) AS opening_odds,
+        SUBSTRING_INDEX(GROUP_CONCAT(s.odds ORDER BY s.created_at DESC), ',', 1) AS current_odds
+        FROM market_snapshots s
+        JOIN outcomes o ON o.id = s.outcome_id
+        WHERE s.market_id = :mid GROUP BY s.outcome_id, o.name");
     $graphStmt->execute([':mid' => $m['id']]);
     $graphRows = $graphStmt->fetchAll();
+    foreach ($graphRows as &$gr) {
+        $gr['opening_odds']   = (float)$gr['opening_odds'];
+        $gr['current_odds']   = (float)$gr['current_odds'];
+        $gr['outcome_id']     = (int)$gr['outcome_id'];
+        $gr['snapshot_count'] = (int)$gr['samples'];
+        unset($gr['samples']);
+    }
+    unset($gr);
 
-    $auditStmt = db()->prepare("SELECT id, admin_id, action, meta, created_at FROM audit_logs WHERE target_type = 'market' AND target_id = :id ORDER BY created_at DESC LIMIT 50");
+    $auditStmt = db()->prepare("SELECT a.id, a.admin_id, u.username AS admin, a.action, a.meta, a.created_at AS at
+        FROM audit_logs a LEFT JOIN users u ON u.id = a.admin_id
+        WHERE a.target_type = 'market' AND a.target_id = :id ORDER BY a.created_at DESC LIMIT 50");
     $auditStmt->execute([':id' => $m['id']]);
     $audit = $auditStmt->fetchAll();
     foreach ($audit as &$a) {
         $a['meta'] = $a['meta'] ? json_decode($a['meta'], true) : null;
+        $a['admin'] = $a['admin'] ?? ($a['admin_id'] == 0 ? 'system' : null);
     }
     unset($a);
 
+    $marketBlock = [
+        'market_id'         => $m['market_id'],
+        'question'          => $m['question'],
+        'category'          => $m['category'],
+        'market_type'       => $m['market_type'],
+        'odds_mode'         => $m['odds_mode'],
+        'status'            => $m['status'],
+        'b'                 => (float)$m['b'],
+        'min_stake'         => (float)$m['min_stake'],
+        'max_stake'         => (float)$m['max_stake'],
+        'max_total_wagered' => (float)$m['max_total_wagered'],
+        'max_odds'          => $m['max_odds'] !== null ? (float)$m['max_odds'] : null,
+        'total_bets'        => (int)$m['total_bets'],
+        'total_wagered'     => (float)$m['total_wagered'],
+        'pause_reason'      => $m['pause_reason'],
+        'void_reason'       => $m['void_reason'],
+        'close_time'        => $m['close_time'],
+        'resolve_time'      => $m['resolve_time'],
+    ];
+
     ok([
-        'market'    => public_market_row($m, $outcomesWithVol),
-        'odds_mode' => $m['odds_mode'],
-        'b'         => (float)$m['b'],
-        'max_odds'  => $m['max_odds'] !== null ? (float)$m['max_odds'] : null,
-        'pause_reason' => $m['pause_reason'],
+        'market'      => $marketBlock,
+        'live_odds'   => $snap,
         'bet_summary' => [
-            'total_bets'   => (int)$bs['total_bets'],
-            'open_bets'    => (int)$bs['open_bets'],
-            'won_bets'     => (int)$bs['won_bets'],
-            'lost_bets'    => (int)$bs['lost_bets'],
-            'void_bets'    => (int)$bs['void_bets'],
-            'total_stake'  => (float)$bs['total_stake'],
-            'total_payout' => (float)$bs['total_payout'],
+            'total_bets'    => (int)$bs['total_bets'],
+            'open'          => (int)$bs['open_bets'],
+            'won'           => (int)$bs['won_bets'],
+            'lost'          => (int)$bs['lost_bets'],
+            'void'          => (int)$bs['void_bets'],
+            'total_staked'  => (float)$bs['total_stake'],
+            'stake_at_risk' => $stakeAtRisk,
+            'max_liability' => $maxLiability,
+            'house_profit'  => round($houseProfit, 2),
         ],
-        'graph_summary' => $graphRows,
-        'audit_log'     => $audit,
+        'volume_by_outcome' => $volumeByOutcome,
+        'graph_summary'     => $graphRows,
+        'audit_log'         => $audit,
     ]);
 }
 
@@ -4101,9 +4214,24 @@ function handle_reset_password(array $body): void {
 // ENTRY POINT (was index.php). All requests dispatch here.
 // ============================================================
 
+// Request ID — propagate inbound or generate. Tag the response + error log.
+$REQUEST_ID = $_SERVER['HTTP_X_REQUEST_ID'] ?? '';
+if (!is_string($REQUEST_ID) || !preg_match('/^[a-zA-Z0-9_-]{8,64}$/', $REQUEST_ID)) {
+    $REQUEST_ID = bin2hex(random_bytes(8));
+}
+$GLOBALS['REQUEST_ID'] = $REQUEST_ID;
+
 header('Content-Type: application/json; charset=utf-8');
 header('X-Content-Type-Options: nosniff');
 header('Referrer-Policy: no-referrer');
+header('X-Request-ID: ' . $REQUEST_ID);
+header('X-Frame-Options: DENY');
+header('Permissions-Policy: interest-cohort=()');
+$onHttps = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
+    || (($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https');
+if ($onHttps) {
+    header('Strict-Transport-Security: max-age=31536000; includeSubDomains');
+}
 
 $frontendUrl = FRONTEND_URL;
 $origin = $_SERVER['HTTP_ORIGIN'] ?? '';
@@ -4163,15 +4291,97 @@ if ($ROUTE === '') {
         'success' => true,
         'data' => [
             'name'    => 'MwasinMarket API',
-            'version' => '5.1',
+            'version' => '5.2',
             'time'    => gmdate('Y-m-d H:i:s') . ' UTC',
             'status'  => 'online',
+            'docs'    => '?route=routes',
         ],
     ], JSON_UNESCAPED_UNICODE);
     exit;
 }
 
-$MAINTENANCE_BYPASS = ['admin_login', 'admin_maintenance', 'health'];
+if ($ROUTE === 'routes') {
+    $ROUTE_CATALOGUE = [
+        // [route, method, auth, description]
+        ['register',                       'POST', 'public', 'Create account (20/IP/hr)'],
+        ['login',                          'POST', 'public', 'User login by username/email/phone'],
+        ['admin_login',                    'POST', 'public', 'Admin login'],
+        ['logout',                         'POST', 'user',   'Revoke current token'],
+        ['profile',                        'GET',  'user',   'Authenticated user details + bet stats'],
+        ['my_bets',                        'GET',  'user',   'User bet history (status, history, page, limit)'],
+        ['health',                         'GET',  'admin',  'DB / SMTP / dependency health (DEBUG_MODE public)'],
+        ['routes',                         'GET',  'public', 'This catalogue'],
+        ['request_email_verification',     'POST', 'user',   'Send email verification link'],
+        ['verify_email',                   'POST', 'public', 'Verify email by token'],
+        ['request_password_reset',         'POST', 'public', 'Send password reset link (no enumeration)'],
+        ['reset_password',                 'POST', 'public', 'Set new password using emailed token'],
+        ['markets',                        'GET',  'public', 'List markets with live odds'],
+        ['market',                         'GET',  'public', 'Single market with live odds'],
+        ['market_history',                 'GET',  'public', 'Odds time-series grouped by outcome'],
+        ['bet',                            'POST', 'user',   'Place a bet (30/user/60s)'],
+        ['admin_create_market',            'POST', 'admin',  'Create a new market'],
+        ['admin_pause_market',             'POST', 'admin',  'Pause an open market'],
+        ['admin_resume_market',            'POST', 'admin',  'Resume a paused market'],
+        ['admin_force_close_market',       'POST', 'admin',  'Force-close a market'],
+        ['admin_reopen_market',            'POST', 'admin',  'Reopen a closed market'],
+        ['admin_settle_market',            'POST', 'admin',  'Pay winners — permanent'],
+        ['admin_void_market',              'POST', 'admin',  'Full refund — permanent'],
+        ['admin_void_bets_by_time',        'POST', 'admin',  'Void all open bets after cutoff'],
+        ['admin_void_bet',                 'POST', 'admin',  'Void a single open bet'],
+        ['admin_archive_market',           'POST', 'admin',  'Archive/unarchive resolved/voided market'],
+        ['admin_edit_market',              'POST', 'admin',  'Edit question/category/source/title/image'],
+        ['admin_adjust_limits',            'POST', 'admin',  'Stake / wager cap / max_odds limits'],
+        ['admin_extend_close_time',        'POST', 'admin',  'Push close deadline forward'],
+        ['admin_set_liquidity',            'POST', 'admin',  'Change LMSR b parameter'],
+        ['admin_reseed_odds',              'POST', 'admin',  'Reset displayed odds (by id or name)'],
+        ['admin_set_odds_mode',            'POST', 'admin',  'Switch lmsr ↔ fixed'],
+        ['admin_stats',                    'GET',  'admin',  'Dashboard overview'],
+        ['admin_market_report',            'GET',  'admin',  'Deep single-market report'],
+        ['admin_notifications',            'GET',  'admin',  'Unread system alerts'],
+        ['admin_mark_notifications_read',  'POST', 'admin',  'Mark notification(s) read'],
+        ['deposit_request',                'POST', 'user',   'Initiate M-Pesa STK Push'],
+        ['payment_status',                 'GET',  'user',   'Poll deposit status'],
+        ['withdrawal_request',             'POST', 'user',   'Request M-Pesa withdrawal'],
+        ['mpesa_webhook',                  'POST', 'mpesa',  'Safaricom STK callback (IP allowlist)'],
+        ['admin_credit_user',              'POST', 'admin',  'Credit / debit user balance'],
+        ['admin_pending_withdrawals',      'GET',  'admin',  'List pending withdrawals'],
+        ['admin_approve_withdrawal',       'POST', 'admin',  'Approve and disburse via B2C'],
+        ['admin_reject_withdrawal',        'POST', 'admin',  'Reject withdrawal and refund lock'],
+        ['admin_payment_report',           'GET',  'admin',  'Deposit / withdrawal aggregates'],
+        ['react',                          'POST', 'user',   'Toggle heart on a market'],
+        ['reactions',                      'GET',  'public', 'Heart count (and own state if authed)'],
+        ['send_message',                   'POST', 'user',   'Send DM to another user'],
+        ['inbox',                          'GET',  'user',   'List conversations'],
+        ['conversation',                   'GET',  'user',   'Thread with one user'],
+        ['delete_message',                 'POST', 'user',   'Soft-delete own message'],
+        ['stickers',                       'GET',  'public', 'List sticker library grouped by folder'],
+        ['admin_upload_sticker',           'POST', 'admin',  'multipart/form-data sticker upload'],
+        ['admin_delete_sticker',           'POST', 'admin',  'Soft-delete a sticker'],
+        ['admin_send_sms',                 'POST', 'admin',  'Send SMS to user or broadcast'],
+        ['admin_sms_history',              'GET',  'admin',  'View sent SMS log'],
+        ['admin_ban_user',                 'POST', 'admin',  'Full account ban'],
+        ['admin_unban_user',               'POST', 'admin',  'Lift ban'],
+        ['admin_restrict_messaging',       'POST', 'admin',  'Toggle messaging restriction'],
+        ['admin_maintenance',              'POST', 'admin',  'Toggle maintenance mode'],
+        ['admin_maintenance',              'GET',  'admin',  'Current maintenance state'],
+    ];
+    $items = [];
+    foreach ($ROUTE_CATALOGUE as $r) {
+        $items[] = ['route' => $r[0], 'method' => $r[1], 'auth' => $r[2], 'description' => $r[3]];
+    }
+    http_response_code(200);
+    echo json_encode([
+        'success' => true,
+        'data' => [
+            'version' => '5.2',
+            'count'   => count($items),
+            'routes'  => $items,
+        ],
+    ], JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+$MAINTENANCE_BYPASS = ['admin_login', 'admin_maintenance', 'health', 'routes'];
 if (!in_array($ROUTE, $MAINTENANCE_BYPASS, true)) {
     check_maintenance();
 }
