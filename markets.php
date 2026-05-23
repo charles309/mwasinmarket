@@ -1,0 +1,1684 @@
+<?php
+declare(strict_types=1);
+
+/**
+ * MwasinMarket API — Markets & Betting
+ * Assumes bootstrap.php is already loaded.
+ *
+ * NOTE: No sell/cash-out route exists. Users buy-only. This prevents
+ * round-trip LMSR arbitrage entirely.
+ */
+
+// ============================================================
+// LMSR ENGINE
+// ============================================================
+
+function lmsr_cost(array $shares, float $b): float {
+    if (empty($shares) || $b <= 0) return 0.0;
+    $max = -INF;
+    foreach ($shares as $s) {
+        $v = (float)$s / $b;
+        if ($v > $max) $max = $v;
+    }
+    if (!is_finite($max)) return 0.0;
+    $sum = 0.0;
+    foreach ($shares as $s) {
+        $sum += exp(((float)$s / $b) - $max);
+    }
+    return $b * ($max + log($sum));
+}
+
+function lmsr_probs(array $shares, float $b): array {
+    if (empty($shares) || $b <= 0) return [];
+    $max = -INF;
+    foreach ($shares as $s) {
+        $v = (float)$s / $b;
+        if ($v > $max) $max = $v;
+    }
+    $exps = [];
+    $sum = 0.0;
+    foreach ($shares as $s) {
+        $e = exp(((float)$s / $b) - $max);
+        $exps[] = $e;
+        $sum += $e;
+    }
+    $probs = [];
+    foreach ($exps as $e) {
+        $probs[] = $sum > 0 ? $e / $sum : 0.0;
+    }
+    return $probs;
+}
+
+function lmsr_buy_cost(array $shares, float $b, int $idx, float $qty): float {
+    $before = lmsr_cost($shares, $b);
+    $shares[$idx] = (float)$shares[$idx] + $qty;
+    $after = lmsr_cost($shares, $b);
+    return $after - $before;
+}
+
+function lmsr_shares_for(array $shares, float $b, int $idx, float $budget): float {
+    if ($budget <= 0 || $b <= 0) return 0.0;
+    $lo = 0.0;
+    $hi = max(1.0, $budget * 2.0);
+    for ($i = 0; $i < 80; $i++) {
+        $cost = lmsr_buy_cost($shares, $b, $idx, $hi);
+        if ($cost >= $budget) break;
+        $hi *= 2.0;
+        if ($hi > 1e12) break;
+    }
+    for ($i = 0; $i < 64; $i++) {
+        $mid = ($lo + $hi) / 2.0;
+        $cost = lmsr_buy_cost($shares, $b, $idx, $mid);
+        if ($cost < $budget) {
+            $lo = $mid;
+        } else {
+            $hi = $mid;
+        }
+    }
+    return ($lo + $hi) / 2.0;
+}
+
+function lmsr_snapshot(array $rows, float $b): array {
+    $shares = [];
+    foreach ($rows as $r) $shares[] = (float)$r['shares'];
+    $probs = lmsr_probs($shares, $b);
+    $out = [];
+    foreach ($rows as $i => $r) {
+        $p = $probs[$i] ?? 0.0;
+        $odds = $p > 0 ? round(1.0 / $p, 4) : 0.0;
+        $out[] = [
+            'outcome_id' => (int)$r['id'],
+            'name'       => $r['name'],
+            'probability'=> round($p, 6),
+            'odds'       => $odds,
+        ];
+    }
+    return $out;
+}
+
+function fixed_snapshot(array $rows): array {
+    $out = [];
+    foreach ($rows as $r) {
+        $odds = (float)($r['fixed_odds'] ?? 0);
+        $p = $odds > 0 ? 1.0 / $odds : 0.0;
+        $out[] = [
+            'outcome_id' => (int)$r['id'],
+            'name'       => $r['name'],
+            'probability'=> round($p, 6),
+            'odds'       => round($odds, 4),
+        ];
+    }
+    return $out;
+}
+
+function market_snapshot(array $rows, float $b, string $oddsMode): array {
+    return $oddsMode === 'fixed' ? fixed_snapshot($rows) : lmsr_snapshot($rows, $b);
+}
+
+function normalize_probs(array $outcomes): array {
+    $probs = [];
+    $sum = 0.0;
+    foreach ($outcomes as $o) {
+        $odds = (float)$o['odds'];
+        if ($odds <= 1.0) {
+            fail('Each outcome odds must be greater than 1.0.', 422, ['outcomes']);
+        }
+        $p = 1.0 / $odds;
+        $probs[] = $p;
+        $sum += $p;
+    }
+    if ($sum <= 0) fail('Invalid odds configuration.', 422, ['outcomes']);
+    $norm = [];
+    foreach ($probs as $p) $norm[] = $p / $sum;
+    return $norm;
+}
+
+function seed_shares(array $probs, float $b): array {
+    // To get given probabilities, shares = b * log(p_i) + constant.
+    // Constant is arbitrary; choose to keep the smallest at zero for stability.
+    $logs = [];
+    foreach ($probs as $p) {
+        $logs[] = $p > 0 ? log($p) : -50.0;
+    }
+    $min = min($logs);
+    $shares = [];
+    foreach ($logs as $l) {
+        $shares[] = round($b * ($l - $min), 8);
+    }
+    return $shares;
+}
+
+function record_market_snapshot(int $marketId, array $rows, float $b, float $vol): void {
+    try {
+        // Detect mode by presence of fixed_odds column populated
+        $hasFixed = false;
+        foreach ($rows as $r) {
+            if (!empty($r['fixed_odds']) && (float)$r['fixed_odds'] > 0) { $hasFixed = true; break; }
+        }
+        $snap = $hasFixed ? fixed_snapshot($rows) : lmsr_snapshot($rows, $b);
+        $stmt = db()->prepare("
+            INSERT INTO market_snapshots (market_id, outcome_id, probability, odds, shares, volume, created_at)
+            VALUES (:mid, :oid, :p, :o, :s, :v, NOW())
+        ");
+        foreach ($rows as $i => $r) {
+            $s = $snap[$i];
+            $stmt->execute([
+                ':mid' => $marketId,
+                ':oid' => (int)$r['id'],
+                ':p'   => $s['probability'],
+                ':o'   => $s['odds'],
+                ':s'   => (float)($r['shares'] ?? 0),
+                ':v'   => $vol,
+            ]);
+        }
+    } catch (Throwable $e) {
+        error_log('[MwasinMarket] market_snapshot failed: ' . $e->getMessage());
+    }
+}
+
+// ============================================================
+// HELPERS
+// ============================================================
+
+function gen_market_id(): string {
+    return bin2hex(random_bytes(8));
+}
+
+function gen_slip_id(): string {
+    return 'BET_' . strtoupper(bin2hex(random_bytes(4)));
+}
+
+function auto_close_markets(): void {
+    try {
+        $stmt = db()->prepare("UPDATE markets SET status='closed', updated_at=NOW()
+            WHERE status='open' AND close_time IS NOT NULL AND close_time <= NOW()");
+        $stmt->execute();
+    } catch (Throwable $e) {
+        error_log('[MwasinMarket] auto_close failed: ' . $e->getMessage());
+    }
+}
+
+function fetch_market_outcomes(int $marketId): array {
+    $stmt = db()->prepare("SELECT id, name, shares, fixed_odds FROM outcomes WHERE market_id = :mid ORDER BY id ASC");
+    $stmt->execute([':mid' => $marketId]);
+    return $stmt->fetchAll();
+}
+
+function public_market_row(array $m, array $outcomes): array {
+    return [
+        'market_id'         => $m['market_id'],
+        'question'          => $m['question'],
+        'title'             => $m['title'],
+        'image_url'         => $m['image_url'],
+        'source'            => $m['source'],
+        'category'          => $m['category'],
+        'market_type'       => $m['market_type'],
+        'status'            => $m['status'],
+        'close_time'        => $m['close_time'],
+        'resolve_time'      => $m['resolve_time'],
+        'void_reason'       => $m['void_reason'],
+        'min_stake'         => (float)$m['min_stake'],
+        'max_stake'         => (float)$m['max_stake'],
+        'max_total_wagered' => (float)$m['max_total_wagered'],
+        'total_bets'        => (int)$m['total_bets'],
+        'total_wagered'     => (float)$m['total_wagered'],
+        'is_archived'       => (bool)$m['is_archived'],
+        'outcomes'          => $outcomes,
+        'created_at'        => $m['created_at'],
+    ];
+}
+
+// ============================================================
+// ROUTE DISPATCH
+// ============================================================
+
+function dispatch_markets_route(string $route, array $body): void {
+    switch ($route) {
+        case 'markets':                    handle_markets_list();           return;
+        case 'market':                     handle_market_single();          return;
+        case 'market_history':             handle_market_history();         return;
+        case 'bet':                        handle_bet($body);               return;
+        case 'admin_create_market':        handle_admin_create_market($body); return;
+        case 'admin_pause_market':         handle_admin_pause_market($body); return;
+        case 'admin_resume_market':        handle_admin_resume_market($body); return;
+        case 'admin_force_close_market':   handle_admin_force_close_market($body); return;
+        case 'admin_reopen_market':        handle_admin_reopen_market($body); return;
+        case 'admin_settle_market':        handle_admin_settle_market($body); return;
+        case 'admin_void_market':          handle_admin_void_market($body); return;
+        case 'admin_void_bets_by_time':    handle_admin_void_bets_by_time($body); return;
+        case 'admin_void_bet':             handle_admin_void_bet($body); return;
+        case 'admin_archive_market':       handle_admin_archive_market($body); return;
+        case 'admin_edit_market':          handle_admin_edit_market($body); return;
+        case 'admin_adjust_limits':        handle_admin_adjust_limits($body); return;
+        case 'admin_extend_close_time':    handle_admin_extend_close_time($body); return;
+        case 'admin_set_liquidity':        handle_admin_set_liquidity($body); return;
+        case 'admin_reseed_odds':          handle_admin_reseed_odds($body); return;
+        case 'admin_set_odds_mode':        handle_admin_set_odds_mode($body); return;
+        case 'admin_stats':                handle_admin_stats(); return;
+        case 'admin_market_report':        handle_admin_market_report(); return;
+    }
+    fail('Route not found', 404);
+}
+
+// ============================================================
+// PUBLIC ROUTES
+// ============================================================
+
+function handle_markets_list(): void {
+    auto_close_markets();
+    $page  = max(1, (int)($_GET['page'] ?? 1));
+    $limit = min(100, max(1, (int)($_GET['limit'] ?? 20)));
+    $offset = ($page - 1) * $limit;
+
+    $where = [];
+    $params = [];
+    if (!empty($_GET['category'])) {
+        $where[] = 'category = :cat';
+        $params[':cat'] = (string)$_GET['category'];
+    }
+    if (!empty($_GET['source'])) {
+        $where[] = 'source = :src';
+        $params[':src'] = (string)$_GET['source'];
+    }
+    if (!empty($_GET['market_type'])) {
+        $mt = (string)$_GET['market_type'];
+        if (!in_array($mt, ['binary', 'categorical'], true)) fail('Invalid market_type.', 422);
+        $where[] = 'market_type = :mt';
+        $params[':mt'] = $mt;
+    }
+    $status = $_GET['status'] ?? 'active';
+    $includeResolved = !empty($_GET['include_resolved']);
+    $includeArchived = !empty($_GET['include_archived']);
+    if ($status === 'active') {
+        $where[] = "status IN ('open', 'paused')";
+    } elseif (in_array($status, ['open', 'paused', 'closed', 'resolved', 'voided'], true)) {
+        $where[] = 'status = :st';
+        $params[':st'] = $status;
+    } elseif ($status === 'all') {
+        // no filter
+    } else {
+        fail('Invalid status filter.', 422);
+    }
+    if (!$includeResolved && $status === 'active') {
+        // already excluded
+    }
+    if (!$includeArchived) {
+        $where[] = 'is_archived = 0';
+    }
+
+    $whereSql = !empty($where) ? 'WHERE ' . implode(' AND ', $where) : '';
+
+    $countStmt = db()->prepare("SELECT COUNT(*) c FROM markets {$whereSql}");
+    $countStmt->execute($params);
+    $total = (int)$countStmt->fetch()['c'];
+
+    $sql = "SELECT * FROM markets {$whereSql} ORDER BY created_at DESC LIMIT :lim OFFSET :off";
+    $stmt = db()->prepare($sql);
+    foreach ($params as $k => $v) $stmt->bindValue($k, $v);
+    $stmt->bindValue(':lim', $limit, PDO::PARAM_INT);
+    $stmt->bindValue(':off', $offset, PDO::PARAM_INT);
+    $stmt->execute();
+    $markets = $stmt->fetchAll();
+
+    if (empty($markets)) {
+        ok(['data' => [], 'meta' => ['total' => 0, 'page' => $page, 'limit' => $limit, 'pages' => 0]]);
+    }
+
+    $marketIds = array_map(fn($m) => (int)$m['id'], $markets);
+    $placeholders = implode(',', array_fill(0, count($marketIds), '?'));
+    $ostmt = db()->prepare("SELECT id, market_id, name, shares, fixed_odds FROM outcomes WHERE market_id IN ({$placeholders}) ORDER BY id ASC");
+    $ostmt->execute($marketIds);
+    $outRows = $ostmt->fetchAll();
+
+    $byMarket = [];
+    foreach ($outRows as $o) {
+        $byMarket[(int)$o['market_id']][] = $o;
+    }
+
+    $result = [];
+    foreach ($markets as $m) {
+        $rows = $byMarket[(int)$m['id']] ?? [];
+        $snap = market_snapshot($rows, (float)$m['b'], (string)$m['odds_mode']);
+        $result[] = public_market_row($m, $snap);
+    }
+
+    ok([
+        'data' => $result,
+        'meta' => ['total' => $total, 'page' => $page, 'limit' => $limit, 'pages' => (int)ceil($total / $limit)],
+    ]);
+}
+
+function handle_market_single(): void {
+    auto_close_markets();
+    $mid = validate_market_id($_GET['market_id'] ?? '');
+    $stmt = db()->prepare("SELECT * FROM markets WHERE market_id = :mid LIMIT 1");
+    $stmt->execute([':mid' => $mid]);
+    $m = $stmt->fetch();
+    if (!$m) fail('Market not found.', 404);
+    $rows = fetch_market_outcomes((int)$m['id']);
+    $snap = market_snapshot($rows, (float)$m['b'], (string)$m['odds_mode']);
+    ok(public_market_row($m, $snap));
+}
+
+function handle_market_history(): void {
+    $mid = validate_market_id($_GET['market_id'] ?? '');
+    $limit = min(500, max(10, (int)($_GET['limit'] ?? 100)));
+    $outcomeFilter = isset($_GET['outcome_id']) ? strict_positive_int($_GET['outcome_id'], 'outcome_id') : 0;
+
+    $mstmt = db()->prepare("SELECT id FROM markets WHERE market_id = :mid LIMIT 1");
+    $mstmt->execute([':mid' => $mid]);
+    $m = $mstmt->fetch();
+    if (!$m) fail('Market not found.', 404);
+
+    $sql = "SELECT outcome_id, probability, odds, volume, created_at FROM market_snapshots WHERE market_id = :mid";
+    $params = [':mid' => (int)$m['id']];
+    if ($outcomeFilter > 0) {
+        $sql .= " AND outcome_id = :oid";
+        $params[':oid'] = $outcomeFilter;
+    }
+    $sql .= " ORDER BY created_at DESC LIMIT :lim";
+    $stmt = db()->prepare($sql);
+    foreach ($params as $k => $v) $stmt->bindValue($k, $v);
+    $stmt->bindValue(':lim', $limit, PDO::PARAM_INT);
+    $stmt->execute();
+    $rows = array_reverse($stmt->fetchAll());
+
+    $series = [];
+    foreach ($rows as $r) {
+        $series[] = [
+            'outcome_id' => (int)$r['outcome_id'],
+            'probability'=> (float)$r['probability'],
+            'odds'       => (float)$r['odds'],
+            'volume'     => (float)$r['volume'],
+            'time'       => $r['created_at'],
+        ];
+    }
+
+    ok([
+        'market_id' => $mid,
+        'history'   => $series,
+        'count'     => count($series),
+    ]);
+}
+
+// ============================================================
+// BET ROUTE
+// ============================================================
+
+function handle_bet(array $body): void {
+    $auth = require_auth();
+    $userId = (int)$auth['user_id'];
+    check_bet_rate_limit($userId);
+
+    require_fields($body, ['market_id', 'outcome_id', 'amount']);
+    $mid     = validate_market_id($body['market_id']);
+    $outId   = strict_positive_int($body['outcome_id'], 'outcome_id');
+    $amount  = strict_positive_amount($body['amount'], 'amount');
+    $isBonus = !empty($body['use_bonus']) ? 1 : 0;
+
+    // Pre-bet auto-close in separate committed transaction
+    auto_close_markets();
+
+    $pdo = db();
+    try {
+        $pdo->beginTransaction();
+
+        // Lock market
+        $mst = $pdo->prepare("SELECT * FROM markets WHERE market_id = :mid FOR UPDATE");
+        $mst->execute([':mid' => $mid]);
+        $m = $mst->fetch();
+        if (!$m) {
+            $pdo->rollBack();
+            fail('Market not found.', 404);
+        }
+
+        // Auto-close inside transaction if needed
+        if ($m['status'] === 'open' && !empty($m['close_time']) && strtotime($m['close_time']) <= time()) {
+            $upd = $pdo->prepare("UPDATE markets SET status='closed', updated_at=NOW() WHERE id = :id");
+            $upd->execute([':id' => $m['id']]);
+            $m['status'] = 'closed';
+        }
+
+        if ($m['status'] === 'paused') {
+            $pdo->rollBack();
+            fail('Market is paused. Try again later.', 503);
+        }
+        if (in_array($m['status'], ['closed', 'resolved', 'voided'], true)) {
+            $pdo->rollBack();
+            fail('Market is not accepting bets.', 409);
+        }
+
+        // Lock user
+        $ust = $pdo->prepare("SELECT id, balance, locked_balance, bonus_balance, is_suspended FROM users WHERE id = :uid FOR UPDATE");
+        $ust->execute([':uid' => $userId]);
+        $user = $ust->fetch();
+        if (!$user) { $pdo->rollBack(); fail('User not found.', 404); }
+        if ((int)$user['is_suspended'] === 1) {
+            $pdo->rollBack();
+            fail('Your account has been suspended.', 403);
+        }
+
+        // Stake range
+        if ($amount < (float)$m['min_stake']) {
+            $pdo->rollBack();
+            fail('Stake is below market minimum of ' . (float)$m['min_stake'], 422, ['amount']);
+        }
+        if ($amount > (float)$m['max_stake']) {
+            $pdo->rollBack();
+            fail('Stake exceeds market maximum of ' . (float)$m['max_stake'], 422, ['amount']);
+        }
+
+        // Wager cap
+        $cap = (float)$m['max_total_wagered'];
+        if ($cap > 0 && ((float)$m['total_wagered'] + $amount) > $cap) {
+            $pdo->rollBack();
+            fail('Market wager cap reached. Bet rejected.', 409);
+        }
+
+        // Lock outcomes
+        $ostmt = $pdo->prepare("SELECT id, name, shares, fixed_odds FROM outcomes WHERE market_id = :mid ORDER BY id ASC FOR UPDATE");
+        $ostmt->execute([':mid' => $m['id']]);
+        $outcomes = $ostmt->fetchAll();
+        if (empty($outcomes)) { $pdo->rollBack(); fail('Market has no outcomes.', 409); }
+
+        $selected = null; $selIdx = -1;
+        foreach ($outcomes as $i => $o) {
+            if ((int)$o['id'] === $outId) { $selected = $o; $selIdx = $i; break; }
+        }
+        if (!$selected) { $pdo->rollBack(); fail('Outcome not found in this market.', 404); }
+
+        $oddsMode = (string)$m['odds_mode'];
+        $b = (float)$m['b'];
+
+        $probBefore = 0.0; $probAfter = 0.0;
+        $oddsAtEntry = 0.0; $sharesAcquired = 0.0;
+        $maxOddsCap = $m['max_odds'] !== null ? (float)$m['max_odds'] : 0.0;
+
+        if ($oddsMode === 'lmsr') {
+            $shares = array_map(fn($o) => (float)$o['shares'], $outcomes);
+            $probsBefore = lmsr_probs($shares, $b);
+            $probBefore = $probsBefore[$selIdx] ?? 0.0;
+            $oddsCurrent = $probBefore > 0 ? 1.0 / $probBefore : INF;
+
+            // Cap check (do not reveal value)
+            if ($maxOddsCap > 0 && $oddsCurrent >= $maxOddsCap) {
+                $pdo->rollBack();
+                create_notification('max_odds_triggered',
+                    "Outcome {$selected['name']} in market {$m['market_id']} exceeded max_odds cap. Betting suspended.",
+                    (int)$m['id']);
+                fail('This selection is not currently available for betting.', 409);
+            }
+
+            // Compute shares acquired by spending amount
+            $sharesAcquired = lmsr_shares_for($shares, $b, $selIdx, $amount);
+            if ($sharesAcquired <= 0) {
+                $pdo->rollBack();
+                fail('Could not price this bet. Try a different amount.', 422);
+            }
+            $sharesAfter = $shares;
+            $sharesAfter[$selIdx] += $sharesAcquired;
+            $probsAfter = lmsr_probs($sharesAfter, $b);
+            $probAfter = $probsAfter[$selIdx] ?? $probBefore;
+            $oddsAfter = $probAfter > 0 ? 1.0 / $probAfter : INF;
+
+            if ($maxOddsCap > 0 && $oddsAfter > $maxOddsCap) {
+                $pdo->rollBack();
+                create_notification('max_odds_triggered',
+                    "Outcome {$selected['name']} in market {$m['market_id']} would exceed max_odds cap.",
+                    (int)$m['id']);
+                fail('This selection is not currently available for betting.', 409);
+            }
+            $effOdds = $sharesAcquired > 0 ? $sharesAcquired / $amount : 0.0;
+            $oddsAtEntry = round($effOdds, 4);
+        } else {
+            // Fixed odds
+            $fxOdds = (float)($selected['fixed_odds'] ?? 0);
+            if ($fxOdds <= 1.0) { $pdo->rollBack(); fail('Outcome has no valid odds set.', 409); }
+            $oddsAtEntry = round($fxOdds, 4);
+            $sharesAcquired = $amount * $oddsAtEntry;
+            $probBefore = 1.0 / $fxOdds;
+            $probAfter = $probBefore;
+        }
+
+        $possibleWin = round($sharesAcquired, 2); // For LMSR shares ARE the payout
+        if ($oddsMode === 'fixed') {
+            $possibleWin = round($amount * $oddsAtEntry, 2);
+        }
+
+        // Bonus vs real balance
+        if ($isBonus === 1) {
+            if ((float)$user['bonus_balance'] < $amount) {
+                $pdo->rollBack();
+                fail('Insufficient bonus balance.', 402);
+            }
+            $balBefore = (float)$user['bonus_balance'];
+            $upd = $pdo->prepare("UPDATE users SET bonus_balance = bonus_balance - :amt, locked_balance = locked_balance + :amt, total_wagered = total_wagered + :amt, updated_at = NOW() WHERE id = :uid AND bonus_balance >= :amt");
+            $upd->execute([':amt' => $amount, ':uid' => $userId]);
+            if ($upd->rowCount() === 0) { $pdo->rollBack(); fail('Insufficient bonus balance.', 402); }
+            $balAfter = $balBefore - $amount;
+        } else {
+            $avail = (float)$user['balance'] - (float)$user['locked_balance'];
+            if ($avail < $amount) {
+                $pdo->rollBack();
+                fail('Insufficient balance.', 402);
+            }
+            $balBefore = (float)$user['balance'];
+            $upd = $pdo->prepare("UPDATE users SET balance = balance - :amt, locked_balance = locked_balance + :amt, total_wagered = total_wagered + :amt, updated_at = NOW() WHERE id = :uid AND balance >= :amt");
+            $upd->execute([':amt' => $amount, ':uid' => $userId]);
+            if ($upd->rowCount() === 0) { $pdo->rollBack(); fail('Insufficient balance.', 402); }
+            $balAfter = $balBefore - $amount;
+        }
+
+        // Update shares (LMSR only)
+        if ($oddsMode === 'lmsr') {
+            $sst = $pdo->prepare("UPDATE outcomes SET shares = shares + :delta WHERE id = :oid");
+            $sst->execute([':delta' => $sharesAcquired, ':oid' => $outId]);
+        }
+
+        // Update market counters
+        $mupd = $pdo->prepare("UPDATE markets SET total_bets = total_bets + 1, total_wagered = total_wagered + :amt, updated_at = NOW() WHERE id = :mid");
+        $mupd->execute([':amt' => $amount, ':mid' => $m['id']]);
+
+        // Bet record
+        $slipId = gen_slip_id();
+        $expiresAt = $m['close_time'] ?: gmdate('Y-m-d H:i:s', time() + TOKEN_TTL);
+        $bins = $pdo->prepare("
+            INSERT INTO bets (slip_id, user_id, market_id, outcome_id, is_bonus_bet, shares, stake, odds_at_entry,
+                              possible_win, prob_before, prob_after, status, expires_at, created_at)
+            VALUES (:sid, :uid, :mid, :oid, :bonus, :sh, :st, :odds, :pw, :pb, :pa, 'open', :exp, NOW())
+        ");
+        $bins->execute([
+            ':sid'   => $slipId,
+            ':uid'   => $userId,
+            ':mid'   => $m['id'],
+            ':oid'   => $outId,
+            ':bonus' => $isBonus,
+            ':sh'    => $sharesAcquired,
+            ':st'    => $amount,
+            ':odds'  => $oddsAtEntry,
+            ':pw'    => $possibleWin,
+            ':pb'    => $probBefore,
+            ':pa'    => $probAfter,
+            ':exp'   => $expiresAt,
+        ]);
+        $betId = (int)$pdo->lastInsertId();
+
+        // Refetch outcomes for snapshot
+        $newRows = fetch_market_outcomes((int)$m['id']);
+        $newTotalWagered = (float)$m['total_wagered'] + $amount;
+
+        $pdo->commit();
+
+        // Post-commit
+        record_market_snapshot((int)$m['id'], $newRows, $b, $newTotalWagered);
+        record_balance_tx($userId, 'bet_placed', -$amount, $balBefore, $balAfter, $slipId, (int)$m['id'], 'Bet on ' . $selected['name']);
+
+        if ($amount >= LARGE_BET_THRESHOLD) {
+            create_notification('large_bet', "Large bet of KES " . number_format($amount, 2) . " placed on market {$m['market_id']}.", (int)$m['id']);
+        }
+        if ($cap > 0 && $newTotalWagered >= $cap * WAGER_CAP_WARNING_RATIO) {
+            create_notification('wager_cap_near', "Market {$m['market_id']} is within 5% of wager cap.", (int)$m['id']);
+        }
+
+        ok([
+            'slip_id'       => $slipId,
+            'bet_id'        => $betId,
+            'market_id'     => $m['market_id'],
+            'outcome_id'    => $outId,
+            'outcome_name'  => $selected['name'],
+            'shares'        => round($sharesAcquired, 6),
+            'stake'         => $amount,
+            'odds_at_entry' => $oddsAtEntry,
+            'possible_win'  => $possibleWin,
+            'prob_before'   => round($probBefore, 6),
+            'prob_after'    => round($probAfter, 6),
+            'is_bonus_bet'  => (bool)$isBonus,
+            'expires_at'    => $expiresAt,
+            'balance_after' => round($balAfter, 2),
+        ], 'Bet placed successfully', 201);
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) $pdo->rollBack();
+        if ($e instanceof RuntimeException) throw $e;
+        internal_error($e, 'bet');
+    }
+}
+
+// ============================================================
+// ADMIN MARKET LIFECYCLE
+// ============================================================
+
+function handle_admin_create_market(array $body): void {
+    $admin = require_admin();
+    require_fields($body, ['question', 'category', 'market_type', 'odds_mode', 'outcomes']);
+    $question = validate_text($body['question'], 'question', 5, 500);
+    $category = validate_text($body['category'], 'category', 2, 60);
+    $source   = isset($body['source']) ? validate_text($body['source'], 'source', 0, 120) : '';
+    $title    = isset($body['title']) ? validate_text($body['title'], 'title', 0, 200) : '';
+    $imageUrl = isset($body['image_url']) ? validate_text($body['image_url'], 'image_url', 0, 500) : '';
+    $marketType = validate_enum($body['market_type'], ['binary', 'categorical'], 'market_type');
+    $oddsMode   = validate_enum($body['odds_mode'], ['lmsr', 'fixed'], 'odds_mode');
+
+    if (!is_array($body['outcomes'])) fail('outcomes must be an array.', 422, ['outcomes']);
+    $outcomes = $body['outcomes'];
+    if ($marketType === 'binary' && count($outcomes) !== 2) fail('Binary markets require exactly 2 outcomes.', 422, ['outcomes']);
+    if ($marketType === 'categorical' && (count($outcomes) < 2 || count($outcomes) > 20)) fail('Categorical markets require 2–20 outcomes.', 422, ['outcomes']);
+
+    $names = [];
+    foreach ($outcomes as $i => $o) {
+        if (!is_array($o)) fail('Each outcome must be an object.', 422, ['outcomes']);
+        if (empty($o['name']) || !is_string($o['name'])) fail("Outcome #{$i}: name required.", 422, ['outcomes']);
+        $n = validate_text($o['name'], "outcomes[{$i}].name", 1, 100);
+        if (in_array($n, $names, true)) fail("Duplicate outcome name: {$n}", 422, ['outcomes']);
+        $names[] = $n;
+        if (!isset($o['odds'])) fail("Outcome #{$i}: odds required.", 422, ['outcomes']);
+        $odds = strict_positive_amount($o['odds'], "outcomes[{$i}].odds", 1.01, 1000.0);
+    }
+
+    $b = isset($body['b']) ? strict_positive_amount($body['b'], 'b', (float)LMSR_B_MIN, (float)LMSR_B_MAX) : (float)LMSR_B;
+    $maxOdds = $oddsMode === 'lmsr'
+        ? (isset($body['max_odds']) ? strict_positive_amount($body['max_odds'], 'max_odds', 1.5, 1000.0) : LMSR_MAX_ODDS)
+        : null;
+    $minStake = isset($body['min_stake']) ? strict_positive_amount($body['min_stake'], 'min_stake', 1.0, 100000.0) : 10.0;
+    $maxStake = isset($body['max_stake']) ? strict_positive_amount($body['max_stake'], 'max_stake', $minStake, 10000000.0) : 100000.0;
+    $maxTotalWagered = isset($body['max_total_wagered'])
+        ? strict_non_negative_amount($body['max_total_wagered'], 'max_total_wagered', 1000000000.0)
+        : 0.0;
+    $closeTime = isset($body['close_time']) ? validate_datetime($body['close_time'], 'close_time') : null;
+    if ($closeTime !== null && strtotime($closeTime) <= time()) {
+        fail('close_time must be in the future.', 422, ['close_time']);
+    }
+    $marketIdStr = isset($body['market_id']) ? validate_market_id($body['market_id']) : gen_market_id();
+
+    // Check uniqueness
+    $check = db()->prepare("SELECT id FROM markets WHERE market_id = :mid LIMIT 1");
+    $check->execute([':mid' => $marketIdStr]);
+    if ($check->fetch()) fail('Market ID already exists.', 409);
+
+    // Validate odds rules
+    $implied = 0.0;
+    foreach ($outcomes as $o) {
+        $implied += 1.0 / (float)$o['odds'];
+    }
+    $warning = null;
+    if ($oddsMode === 'fixed') {
+        if ($implied < FIXED_MIN_OVERROUND) {
+            fail("Fixed market overround too low. Implied probability sum = " . round($implied, 4) . ". Must be >= " . FIXED_MIN_OVERROUND . ". Adjust odds to ensure the house has a margin.", 422, ['outcomes']);
+        }
+    } else {
+        if (abs($implied - 1.0) > 0.01) {
+            $warning = "Provided odds imply probability sum of " . round($implied, 4) . "; LMSR will normalise to 1.0. Opening odds will differ from requested.";
+        }
+    }
+
+    $pdo = db();
+    try {
+        $pdo->beginTransaction();
+
+        $ins = $pdo->prepare("
+            INSERT INTO markets
+                (market_id, title, image_url, source, question, category, market_type, odds_mode, status,
+                 close_time, b, min_stake, max_stake, max_total_wagered, max_odds,
+                 total_bets, total_wagered, is_archived, created_by, created_at, updated_at)
+            VALUES
+                (:mid, :title, :img, :src, :q, :cat, :mt, :om, 'open',
+                 :ct, :b, :mins, :maxs, :mtw, :modds,
+                 0, 0, 0, :cb, NOW(), NOW())
+        ");
+        $ins->execute([
+            ':mid'  => $marketIdStr,
+            ':title'=> $title,
+            ':img'  => $imageUrl,
+            ':src'  => $source,
+            ':q'    => $question,
+            ':cat'  => $category,
+            ':mt'   => $marketType,
+            ':om'   => $oddsMode,
+            ':ct'   => $closeTime,
+            ':b'    => $b,
+            ':mins' => $minStake,
+            ':maxs' => $maxStake,
+            ':mtw'  => $maxTotalWagered,
+            ':modds'=> $maxOdds,
+            ':cb'   => $admin['user_id'],
+        ]);
+        $marketDbId = (int)$pdo->lastInsertId();
+
+        // Outcomes
+        if ($oddsMode === 'lmsr') {
+            // Normalize probs
+            $probs = normalize_probs($outcomes);
+            $shares = seed_shares($probs, $b);
+            $oIns = $pdo->prepare("INSERT INTO outcomes (market_id, name, shares, fixed_odds, created_at) VALUES (:mid, :n, :s, NULL, NOW())");
+            foreach ($outcomes as $i => $o) {
+                $oIns->execute([':mid' => $marketDbId, ':n' => $o['name'], ':s' => $shares[$i]]);
+            }
+        } else {
+            $oIns = $pdo->prepare("INSERT INTO outcomes (market_id, name, shares, fixed_odds, created_at) VALUES (:mid, :n, 0, :fo, NOW())");
+            foreach ($outcomes as $o) {
+                $oIns->execute([':mid' => $marketDbId, ':n' => $o['name'], ':fo' => (float)$o['odds']]);
+            }
+        }
+
+        $pdo->commit();
+
+        $rows = fetch_market_outcomes($marketDbId);
+        record_market_snapshot($marketDbId, $rows, $b, 0.0);
+        audit_log('create_market', (int)$admin['user_id'], 'market', $marketDbId, [
+            'market_id' => $marketIdStr, 'question' => $question, 'odds_mode' => $oddsMode, 'market_type' => $marketType,
+        ]);
+
+        $snap = market_snapshot($rows, $b, $oddsMode);
+        ok([
+            'market_id'   => $marketIdStr,
+            'status'      => 'open',
+            'odds_mode'   => $oddsMode,
+            'market_type' => $marketType,
+            'outcomes'    => $snap,
+            'warning'     => $warning,
+        ], 'Market created', 201);
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) $pdo->rollBack();
+        if ($e instanceof RuntimeException) throw $e;
+        internal_error($e, 'admin_create_market');
+    }
+}
+
+function _admin_market_lock(PDO $pdo, string $marketIdStr): array {
+    $st = $pdo->prepare("SELECT * FROM markets WHERE market_id = :mid FOR UPDATE");
+    $st->execute([':mid' => $marketIdStr]);
+    $m = $st->fetch();
+    if (!$m) { $pdo->rollBack(); fail('Market not found.', 404); }
+    return $m;
+}
+
+function handle_admin_pause_market(array $body): void {
+    $admin = require_admin();
+    require_fields($body, ['market_id']);
+    $mid = validate_market_id($body['market_id']);
+    $reason = isset($body['pause_reason']) ? validate_text($body['pause_reason'], 'pause_reason', 0, 500) : '';
+    $pdo = db();
+    try {
+        $pdo->beginTransaction();
+        $m = _admin_market_lock($pdo, $mid);
+        if ($m['status'] !== 'open') { $pdo->rollBack(); fail('Only open markets can be paused.', 409); }
+        $upd = $pdo->prepare("UPDATE markets SET status='paused', pause_reason=:r, updated_at=NOW() WHERE id=:id");
+        $upd->execute([':r' => $reason, ':id' => $m['id']]);
+        $pdo->commit();
+        audit_log('pause_market', (int)$admin['user_id'], 'market', (int)$m['id'], ['reason' => $reason]);
+        ok(['market_id' => $mid, 'status' => 'paused'], 'Market paused');
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) $pdo->rollBack();
+        if ($e instanceof RuntimeException) throw $e;
+        internal_error($e, 'pause_market');
+    }
+}
+
+function handle_admin_resume_market(array $body): void {
+    $admin = require_admin();
+    require_fields($body, ['market_id']);
+    $mid = validate_market_id($body['market_id']);
+    $pdo = db();
+    try {
+        $pdo->beginTransaction();
+        $m = _admin_market_lock($pdo, $mid);
+        if ($m['status'] !== 'paused') { $pdo->rollBack(); fail('Only paused markets can be resumed.', 409); }
+        $upd = $pdo->prepare("UPDATE markets SET status='open', pause_reason=NULL, updated_at=NOW() WHERE id=:id");
+        $upd->execute([':id' => $m['id']]);
+        $pdo->commit();
+        audit_log('resume_market', (int)$admin['user_id'], 'market', (int)$m['id'], []);
+        ok(['market_id' => $mid, 'status' => 'open'], 'Market resumed');
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) $pdo->rollBack();
+        if ($e instanceof RuntimeException) throw $e;
+        internal_error($e, 'resume_market');
+    }
+}
+
+function handle_admin_force_close_market(array $body): void {
+    $admin = require_admin();
+    require_fields($body, ['market_id']);
+    $mid = validate_market_id($body['market_id']);
+    $reason = isset($body['reason']) ? validate_text($body['reason'], 'reason', 0, 500) : '';
+    $pdo = db();
+    try {
+        $pdo->beginTransaction();
+        $m = _admin_market_lock($pdo, $mid);
+        if (in_array($m['status'], ['resolved', 'voided'], true)) { $pdo->rollBack(); fail('Terminal markets cannot be force-closed.', 409); }
+        if ($m['status'] === 'closed') { $pdo->rollBack(); fail('Market is already closed.', 409); }
+        $upd = $pdo->prepare("UPDATE markets SET status='closed', updated_at=NOW() WHERE id=:id");
+        $upd->execute([':id' => $m['id']]);
+        $pdo->commit();
+        audit_log('force_close_market', (int)$admin['user_id'], 'market', (int)$m['id'], ['reason' => $reason]);
+        ok(['market_id' => $mid, 'status' => 'closed'], 'Market force-closed');
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) $pdo->rollBack();
+        if ($e instanceof RuntimeException) throw $e;
+        internal_error($e, 'force_close_market');
+    }
+}
+
+function handle_admin_reopen_market(array $body): void {
+    $admin = require_admin();
+    require_fields($body, ['market_id']);
+    $mid = validate_market_id($body['market_id']);
+    $pdo = db();
+    try {
+        $pdo->beginTransaction();
+        $m = _admin_market_lock($pdo, $mid);
+        if ($m['status'] !== 'closed') { $pdo->rollBack(); fail('Only closed markets can be reopened.', 409); }
+        $clearCT = !empty($m['close_time']) && strtotime($m['close_time']) <= time();
+        if ($clearCT) {
+            $upd = $pdo->prepare("UPDATE markets SET status='open', close_time=NULL, updated_at=NOW() WHERE id=:id");
+            $upd->execute([':id' => $m['id']]);
+        } else {
+            $upd = $pdo->prepare("UPDATE markets SET status='open', updated_at=NOW() WHERE id=:id");
+            $upd->execute([':id' => $m['id']]);
+        }
+        $pdo->commit();
+        audit_log('reopen_market', (int)$admin['user_id'], 'market', (int)$m['id'], ['close_time_cleared' => $clearCT]);
+        ok(['market_id' => $mid, 'status' => 'open', 'close_time_cleared' => $clearCT], 'Market reopened');
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) $pdo->rollBack();
+        if ($e instanceof RuntimeException) throw $e;
+        internal_error($e, 'reopen_market');
+    }
+}
+
+function handle_admin_settle_market(array $body): void {
+    $admin = require_admin();
+    require_fields($body, ['market_id', 'winning_outcome_id']);
+    $mid    = validate_market_id($body['market_id']);
+    $winOid = strict_positive_int($body['winning_outcome_id'], 'winning_outcome_id');
+    $pdo = db();
+    try {
+        $pdo->beginTransaction();
+        $m = _admin_market_lock($pdo, $mid);
+        if (in_array($m['status'], ['resolved', 'voided'], true)) { $pdo->rollBack(); fail('Market is already in terminal state.', 409); }
+
+        // Validate winning outcome
+        $owin = $pdo->prepare("SELECT id, name FROM outcomes WHERE id = :oid AND market_id = :mid LIMIT 1");
+        $owin->execute([':oid' => $winOid, ':mid' => $m['id']]);
+        $winRow = $owin->fetch();
+        if (!$winRow) { $pdo->rollBack(); fail('Winning outcome does not belong to this market.', 422); }
+
+        // Winners: open bets on winning outcome
+        $wstmt = $pdo->prepare("SELECT id, user_id, stake, possible_win, is_bonus_bet FROM bets WHERE market_id = :mid AND status = 'open' AND outcome_id = :oid FOR UPDATE");
+        $wstmt->execute([':mid' => $m['id'], ':oid' => $winOid]);
+        $winners = $wstmt->fetchAll();
+
+        // Losers: open bets on other outcomes
+        $lstmt = $pdo->prepare("SELECT id, user_id, stake, is_bonus_bet FROM bets WHERE market_id = :mid AND status = 'open' AND outcome_id != :oid FOR UPDATE");
+        $lstmt->execute([':mid' => $m['id'], ':oid' => $winOid]);
+        $losers = $lstmt->fetchAll();
+
+        // Batch winners
+        if (!empty($winners)) {
+            $winIds = array_map(fn($r) => (int)$r['id'], $winners);
+            $ph = implode(',', array_fill(0, count($winIds), '?'));
+            $upd = $pdo->prepare("UPDATE bets SET status='won', payout=possible_win WHERE id IN ({$ph})");
+            $upd->execute($winIds);
+
+            // Group payouts by user_id (real vs bonus)
+            $realPayouts = []; $bonusPayouts = []; $realUnlock = []; $bonusUnlock = [];
+            $realWinAdd = [];
+            foreach ($winners as $w) {
+                $uid = (int)$w['user_id'];
+                $payout = (float)$w['possible_win'];
+                $stake = (float)$w['stake'];
+                if ((int)$w['is_bonus_bet'] === 1) {
+                    $bonusPayouts[$uid] = ($bonusPayouts[$uid] ?? 0.0) + $payout;
+                    $bonusUnlock[$uid]  = ($bonusUnlock[$uid] ?? 0.0) + $stake;
+                } else {
+                    $realPayouts[$uid] = ($realPayouts[$uid] ?? 0.0) + $payout;
+                    $realUnlock[$uid]  = ($realUnlock[$uid] ?? 0.0) + $stake;
+                    $realWinAdd[$uid]  = ($realWinAdd[$uid] ?? 0.0) + $payout;
+                }
+            }
+
+            $uReal = $pdo->prepare("UPDATE users SET balance = balance + :add, locked_balance = locked_balance - :unl, total_wins = total_wins + :win, updated_at=NOW() WHERE id = :uid");
+            foreach ($realPayouts as $uid => $payout) {
+                $uReal->execute([':add' => $payout, ':unl' => $realUnlock[$uid], ':win' => $realWinAdd[$uid], ':uid' => $uid]);
+            }
+            $uBonus = $pdo->prepare("UPDATE users SET bonus_balance = bonus_balance + :add, locked_balance = locked_balance - :unl, updated_at=NOW() WHERE id = :uid");
+            foreach ($bonusPayouts as $uid => $payout) {
+                $uBonus->execute([':add' => $payout, ':unl' => $bonusUnlock[$uid], ':uid' => $uid]);
+            }
+        }
+
+        // Batch losers
+        if (!empty($losers)) {
+            $loseIds = array_map(fn($r) => (int)$r['id'], $losers);
+            $ph = implode(',', array_fill(0, count($loseIds), '?'));
+            $upd = $pdo->prepare("UPDATE bets SET status='lost', payout=0 WHERE id IN ({$ph})");
+            $upd->execute($loseIds);
+
+            $unlockReal = []; $unlockBonus = [];
+            foreach ($losers as $l) {
+                $uid = (int)$l['user_id'];
+                $stake = (float)$l['stake'];
+                if ((int)$l['is_bonus_bet'] === 1) {
+                    $unlockBonus[$uid] = ($unlockBonus[$uid] ?? 0.0) + $stake;
+                } else {
+                    $unlockReal[$uid] = ($unlockReal[$uid] ?? 0.0) + $stake;
+                }
+            }
+            $uUnlock = $pdo->prepare("UPDATE users SET locked_balance = locked_balance - :unl, updated_at=NOW() WHERE id = :uid");
+            foreach ($unlockReal as $uid => $unl) $uUnlock->execute([':unl' => $unl, ':uid' => $uid]);
+            foreach ($unlockBonus as $uid => $unl) $uUnlock->execute([':unl' => $unl, ':uid' => $uid]);
+        }
+
+        $mUpd = $pdo->prepare("UPDATE markets SET status='resolved', resolve_time=NOW(), updated_at=NOW() WHERE id=:id");
+        $mUpd->execute([':id' => $m['id']]);
+
+        $pdo->commit();
+
+        // Post-commit: balance_transactions for each affected user
+        if (!empty($winners)) {
+            foreach ($winners as $w) {
+                record_balance_tx((int)$w['user_id'], 'bet_won', (float)$w['possible_win'], 0.0, 0.0, null, (int)$m['id'], 'Won bet on ' . $winRow['name']);
+            }
+        }
+        if (!empty($losers)) {
+            foreach ($losers as $l) {
+                record_balance_tx((int)$l['user_id'], 'bet_lost', 0.0, 0.0, 0.0, null, (int)$m['id'], 'Lost bet (market settled)');
+            }
+        }
+        audit_log('settle_market', (int)$admin['user_id'], 'market', (int)$m['id'], [
+            'winning_outcome_id' => $winOid,
+            'winning_outcome_name' => $winRow['name'],
+            'winners_count' => count($winners),
+            'losers_count'  => count($losers),
+        ]);
+
+        ok([
+            'market_id'        => $mid,
+            'status'           => 'resolved',
+            'winning_outcome'  => ['outcome_id' => $winOid, 'name' => $winRow['name']],
+            'winners_count'    => count($winners),
+            'losers_count'     => count($losers),
+        ], 'Market settled');
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) $pdo->rollBack();
+        if ($e instanceof RuntimeException) throw $e;
+        internal_error($e, 'settle_market');
+    }
+}
+
+function handle_admin_void_market(array $body): void {
+    $admin = require_admin();
+    require_fields($body, ['market_id', 'reason']);
+    $mid = validate_market_id($body['market_id']);
+    $reason = validate_text($body['reason'], 'reason', 5, 500);
+    $pdo = db();
+    try {
+        $pdo->beginTransaction();
+        $m = _admin_market_lock($pdo, $mid);
+        if (in_array($m['status'], ['resolved', 'voided'], true)) { $pdo->rollBack(); fail('Market is already in terminal state.', 409); }
+
+        $bstmt = $pdo->prepare("SELECT id, user_id, outcome_id, stake, shares, is_bonus_bet FROM bets WHERE market_id = :mid AND status = 'open' FOR UPDATE");
+        $bstmt->execute([':mid' => $m['id']]);
+        $bets = $bstmt->fetchAll();
+
+        if (!empty($bets)) {
+            $betIds = array_map(fn($r) => (int)$r['id'], $bets);
+            $ph = implode(',', array_fill(0, count($betIds), '?'));
+            $upd = $pdo->prepare("UPDATE bets SET status='void', payout=stake, void_reason=? WHERE id IN ({$ph})");
+            $upd->execute(array_merge([$reason], $betIds));
+
+            $refundReal = []; $refundBonus = [];
+            $sharesPerOutcome = [];
+            $stakeReversal = 0.0;
+            foreach ($bets as $b) {
+                $uid = (int)$b['user_id'];
+                $stake = (float)$b['stake'];
+                if ((int)$b['is_bonus_bet'] === 1) {
+                    $refundBonus[$uid] = ($refundBonus[$uid] ?? 0.0) + $stake;
+                } else {
+                    $refundReal[$uid] = ($refundReal[$uid] ?? 0.0) + $stake;
+                }
+                $oid = (int)$b['outcome_id'];
+                $sharesPerOutcome[$oid] = ($sharesPerOutcome[$oid] ?? 0.0) + (float)$b['shares'];
+                $stakeReversal += $stake;
+            }
+            $uReal = $pdo->prepare("UPDATE users SET balance = balance + :amt, locked_balance = locked_balance - :amt, total_wagered = GREATEST(0, total_wagered - :amt), updated_at=NOW() WHERE id = :uid");
+            foreach ($refundReal as $uid => $amt) $uReal->execute([':amt' => $amt, ':uid' => $uid]);
+            $uBonus = $pdo->prepare("UPDATE users SET bonus_balance = bonus_balance + :amt, locked_balance = locked_balance - :amt, total_wagered = GREATEST(0, total_wagered - :amt), updated_at=NOW() WHERE id = :uid");
+            foreach ($refundBonus as $uid => $amt) $uBonus->execute([':amt' => $amt, ':uid' => $uid]);
+
+            if ($m['odds_mode'] === 'lmsr') {
+                $oUpd = $pdo->prepare("UPDATE outcomes SET shares = GREATEST(0, shares - :d) WHERE id = :oid");
+                foreach ($sharesPerOutcome as $oid => $delta) {
+                    $oUpd->execute([':d' => $delta, ':oid' => $oid]);
+                }
+            }
+
+            $mUpd = $pdo->prepare("UPDATE markets SET status='voided', void_reason=:r, total_wagered = GREATEST(0, total_wagered - :s), total_bets = GREATEST(0, total_bets - :c), updated_at=NOW() WHERE id=:id");
+            $mUpd->execute([':r' => $reason, ':s' => $stakeReversal, ':c' => count($bets), ':id' => $m['id']]);
+        } else {
+            $mUpd = $pdo->prepare("UPDATE markets SET status='voided', void_reason=:r, updated_at=NOW() WHERE id=:id");
+            $mUpd->execute([':r' => $reason, ':id' => $m['id']]);
+        }
+
+        $pdo->commit();
+
+        foreach ($bets as $b) {
+            record_balance_tx((int)$b['user_id'], 'bet_voided', (float)$b['stake'], 0.0, 0.0, null, (int)$m['id'], 'Market voided: ' . $reason);
+        }
+        audit_log('void_market', (int)$admin['user_id'], 'market', (int)$m['id'], [
+            'reason' => $reason, 'bets_voided' => count($bets),
+        ]);
+
+        ok([
+            'market_id'   => $mid,
+            'status'      => 'voided',
+            'bets_voided' => count($bets),
+            'reason'      => $reason,
+        ], 'Market voided. All open bets refunded.');
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) $pdo->rollBack();
+        if ($e instanceof RuntimeException) throw $e;
+        internal_error($e, 'void_market');
+    }
+}
+
+function handle_admin_void_bets_by_time(array $body): void {
+    $admin = require_admin();
+    require_fields($body, ['market_id', 'cutoff_time', 'reason']);
+    $mid    = validate_market_id($body['market_id']);
+    $cutoff = validate_datetime($body['cutoff_time'], 'cutoff_time');
+    if (strtotime($cutoff) >= time()) fail('cutoff_time must be in the past.', 422, ['cutoff_time']);
+    $reason = validate_text($body['reason'], 'reason', 10, 500);
+
+    $pdo = db();
+    try {
+        $pdo->beginTransaction();
+        $m = _admin_market_lock($pdo, $mid);
+        if ($m['status'] === 'voided') { $pdo->rollBack(); fail('Market is already voided.', 409); }
+
+        $bstmt = $pdo->prepare("SELECT id, user_id, outcome_id, stake, shares, is_bonus_bet FROM bets WHERE market_id = :mid AND status = 'open' AND created_at > :cut FOR UPDATE");
+        $bstmt->execute([':mid' => $m['id'], ':cut' => $cutoff]);
+        $bets = $bstmt->fetchAll();
+
+        if (empty($bets)) {
+            $pdo->rollBack();
+            fail('No open bets found after the specified cutoff time.', 404);
+        }
+
+        $betIds = array_map(fn($r) => (int)$r['id'], $bets);
+        $ph = implode(',', array_fill(0, count($betIds), '?'));
+        $upd = $pdo->prepare("UPDATE bets SET status='void', payout=stake, void_reason=? WHERE id IN ({$ph})");
+        $upd->execute(array_merge([$reason], $betIds));
+
+        $refundReal = []; $refundBonus = [];
+        $sharesPerOutcome = [];
+        $totalRefund = 0.0;
+        $affectedUsers = [];
+        foreach ($bets as $b) {
+            $uid = (int)$b['user_id'];
+            $stake = (float)$b['stake'];
+            $affectedUsers[$uid] = true;
+            if ((int)$b['is_bonus_bet'] === 1) {
+                $refundBonus[$uid] = ($refundBonus[$uid] ?? 0.0) + $stake;
+            } else {
+                $refundReal[$uid] = ($refundReal[$uid] ?? 0.0) + $stake;
+            }
+            $oid = (int)$b['outcome_id'];
+            $sharesPerOutcome[$oid] = ($sharesPerOutcome[$oid] ?? 0.0) + (float)$b['shares'];
+            $totalRefund += $stake;
+        }
+        $uReal = $pdo->prepare("UPDATE users SET balance = balance + :amt, locked_balance = locked_balance - :amt, total_wagered = GREATEST(0, total_wagered - :amt), updated_at=NOW() WHERE id = :uid");
+        foreach ($refundReal as $uid => $amt) $uReal->execute([':amt' => $amt, ':uid' => $uid]);
+        $uBonus = $pdo->prepare("UPDATE users SET bonus_balance = bonus_balance + :amt, locked_balance = locked_balance - :amt, total_wagered = GREATEST(0, total_wagered - :amt), updated_at=NOW() WHERE id = :uid");
+        foreach ($refundBonus as $uid => $amt) $uBonus->execute([':amt' => $amt, ':uid' => $uid]);
+
+        if ($m['odds_mode'] === 'lmsr') {
+            $oUpd = $pdo->prepare("UPDATE outcomes SET shares = GREATEST(0, shares - :d) WHERE id = :oid");
+            foreach ($sharesPerOutcome as $oid => $delta) {
+                $oUpd->execute([':d' => $delta, ':oid' => $oid]);
+            }
+        }
+        $mUpd = $pdo->prepare("UPDATE markets SET total_wagered = GREATEST(0, total_wagered - :s), total_bets = GREATEST(0, total_bets - :c), updated_at=NOW() WHERE id = :id");
+        $mUpd->execute([':s' => $totalRefund, ':c' => count($bets), ':id' => $m['id']]);
+
+        $pdo->commit();
+
+        foreach ($bets as $b) {
+            record_balance_tx((int)$b['user_id'], 'bet_voided', (float)$b['stake'], 0.0, 0.0, null, (int)$m['id'], 'Voided by time: ' . $reason);
+        }
+        audit_log('void_bets_by_time', (int)$admin['user_id'], 'market', (int)$m['id'], [
+            'cutoff_time' => $cutoff,
+            'reason' => $reason,
+            'count' => count($bets),
+            'total_refunded' => round($totalRefund, 2),
+            'affected_users' => count($affectedUsers),
+        ]);
+
+        ok([
+            'market_id'      => $mid,
+            'cutoff_time'    => $cutoff,
+            'reason'         => $reason,
+            'bets_voided'    => count($bets),
+            'total_refunded' => round($totalRefund, 2),
+            'affected_users' => count($affectedUsers),
+        ], 'Bets voided successfully');
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) $pdo->rollBack();
+        if ($e instanceof RuntimeException) throw $e;
+        internal_error($e, 'void_bets_by_time');
+    }
+}
+
+function handle_admin_void_bet(array $body): void {
+    $admin = require_admin();
+    require_fields($body, ['slip_id', 'reason']);
+    $slipId = is_string($body['slip_id']) ? trim($body['slip_id']) : '';
+    if (!preg_match('/^[A-Za-z0-9_\-]{1,20}$/', $slipId)) fail('Invalid slip_id.', 422, ['slip_id']);
+    $reason = validate_text($body['reason'], 'reason', 5, 500);
+
+    $pdo = db();
+    try {
+        $pdo->beginTransaction();
+        $bst = $pdo->prepare("SELECT b.*, m.odds_mode, m.market_id AS mpid FROM bets b JOIN markets m ON m.id = b.market_id WHERE b.slip_id = :sid FOR UPDATE");
+        $bst->execute([':sid' => $slipId]);
+        $bet = $bst->fetch();
+        if (!$bet) { $pdo->rollBack(); fail('Bet not found.', 404); }
+        if ($bet['status'] !== 'open') { $pdo->rollBack(); fail('Only open bets can be voided.', 409); }
+
+        $stake = (float)$bet['stake'];
+        $upd = $pdo->prepare("UPDATE bets SET status='void', payout=stake, void_reason=:r WHERE id=:id");
+        $upd->execute([':r' => $reason, ':id' => $bet['id']]);
+
+        if ((int)$bet['is_bonus_bet'] === 1) {
+            $uupd = $pdo->prepare("UPDATE users SET bonus_balance = bonus_balance + :amt, locked_balance = locked_balance - :amt, total_wagered = GREATEST(0, total_wagered - :amt), updated_at=NOW() WHERE id = :uid");
+        } else {
+            $uupd = $pdo->prepare("UPDATE users SET balance = balance + :amt, locked_balance = locked_balance - :amt, total_wagered = GREATEST(0, total_wagered - :amt), updated_at=NOW() WHERE id = :uid");
+        }
+        $uupd->execute([':amt' => $stake, ':uid' => $bet['user_id']]);
+
+        if ($bet['odds_mode'] === 'lmsr') {
+            $oUpd = $pdo->prepare("UPDATE outcomes SET shares = GREATEST(0, shares - :d) WHERE id = :oid");
+            $oUpd->execute([':d' => (float)$bet['shares'], ':oid' => $bet['outcome_id']]);
+        }
+        $mUpd = $pdo->prepare("UPDATE markets SET total_wagered = GREATEST(0, total_wagered - :s), total_bets = GREATEST(0, total_bets - 1), updated_at=NOW() WHERE id = :id");
+        $mUpd->execute([':s' => $stake, ':id' => $bet['market_id']]);
+
+        $pdo->commit();
+
+        record_balance_tx((int)$bet['user_id'], 'bet_voided', $stake, 0.0, 0.0, $slipId, (int)$bet['market_id'], 'Bet voided: ' . $reason);
+        audit_log('void_bet', (int)$admin['user_id'], 'bet', (int)$bet['id'], [
+            'slip_id' => $slipId, 'reason' => $reason, 'stake' => $stake,
+        ]);
+
+        ok([
+            'slip_id' => $slipId,
+            'status'  => 'void',
+            'refunded' => $stake,
+            'reason'  => $reason,
+        ], 'Bet voided');
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) $pdo->rollBack();
+        if ($e instanceof RuntimeException) throw $e;
+        internal_error($e, 'void_bet');
+    }
+}
+
+function handle_admin_archive_market(array $body): void {
+    $admin = require_admin();
+    require_fields($body, ['market_id']);
+    $mid = validate_market_id($body['market_id']);
+    $archive = array_key_exists('archive', $body) ? (bool)$body['archive'] : true;
+    $pdo = db();
+    try {
+        $pdo->beginTransaction();
+        $m = _admin_market_lock($pdo, $mid);
+        if (!in_array($m['status'], ['resolved', 'voided'], true)) { $pdo->rollBack(); fail('Only resolved or voided markets can be archived.', 409); }
+        $val = $archive ? 1 : 0;
+        $upd = $pdo->prepare("UPDATE markets SET is_archived = :v, updated_at=NOW() WHERE id=:id");
+        $upd->execute([':v' => $val, ':id' => $m['id']]);
+        $pdo->commit();
+        audit_log('archive_market', (int)$admin['user_id'], 'market', (int)$m['id'], ['archived' => (bool)$val]);
+        ok(['market_id' => $mid, 'is_archived' => (bool)$val], $val ? 'Market archived' : 'Market unarchived');
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) $pdo->rollBack();
+        if ($e instanceof RuntimeException) throw $e;
+        internal_error($e, 'archive_market');
+    }
+}
+
+function handle_admin_edit_market(array $body): void {
+    $admin = require_admin();
+    require_fields($body, ['market_id']);
+    $mid = validate_market_id($body['market_id']);
+    $pdo = db();
+    try {
+        $pdo->beginTransaction();
+        $m = _admin_market_lock($pdo, $mid);
+        if (in_array($m['status'], ['resolved', 'voided'], true)) { $pdo->rollBack(); fail('Terminal markets cannot be edited.', 409); }
+
+        $sets = [];
+        $params = [':id' => $m['id']];
+        $changes = [];
+        if (isset($body['question'])) {
+            $q = validate_text($body['question'], 'question', 5, 500);
+            $sets[] = 'question = :q'; $params[':q'] = $q; $changes['question'] = $q;
+        }
+        if (isset($body['category'])) {
+            $c = validate_text($body['category'], 'category', 2, 60);
+            $sets[] = 'category = :c'; $params[':c'] = $c; $changes['category'] = $c;
+        }
+        if (isset($body['source'])) {
+            $s = validate_text($body['source'], 'source', 0, 120);
+            $sets[] = 'source = :s'; $params[':s'] = $s; $changes['source'] = $s;
+        }
+        if (isset($body['title'])) {
+            $t = validate_text($body['title'], 'title', 0, 200);
+            $sets[] = 'title = :t'; $params[':t'] = $t; $changes['title'] = $t;
+        }
+        if (isset($body['image_url'])) {
+            $iu = validate_text($body['image_url'], 'image_url', 0, 500);
+            $sets[] = 'image_url = :iu'; $params[':iu'] = $iu; $changes['image_url'] = $iu;
+        }
+        if (empty($sets)) { $pdo->rollBack(); fail('No editable fields provided.', 422); }
+        $sets[] = 'updated_at = NOW()';
+        $upd = $pdo->prepare("UPDATE markets SET " . implode(', ', $sets) . " WHERE id = :id");
+        $upd->execute($params);
+        $pdo->commit();
+        audit_log('edit_market', (int)$admin['user_id'], 'market', (int)$m['id'], $changes);
+        ok(['market_id' => $mid, 'changes' => $changes], 'Market updated');
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) $pdo->rollBack();
+        if ($e instanceof RuntimeException) throw $e;
+        internal_error($e, 'edit_market');
+    }
+}
+
+// ============================================================
+// ADMIN ODDS & PRICING
+// ============================================================
+
+function handle_admin_adjust_limits(array $body): void {
+    $admin = require_admin();
+    require_fields($body, ['market_id']);
+    $mid = validate_market_id($body['market_id']);
+    $pdo = db();
+    try {
+        $pdo->beginTransaction();
+        $m = _admin_market_lock($pdo, $mid);
+        if (in_array($m['status'], ['resolved', 'voided'], true)) { $pdo->rollBack(); fail('Terminal markets cannot be modified.', 409); }
+
+        $sets = [];
+        $params = [':id' => $m['id']];
+        $changes = [];
+
+        $minStake = (float)$m['min_stake'];
+        $maxStake = (float)$m['max_stake'];
+        if (isset($body['min_stake'])) {
+            $minStake = strict_positive_amount($body['min_stake'], 'min_stake', 1.0, 100000.0);
+            $sets[] = 'min_stake = :mins'; $params[':mins'] = $minStake; $changes['min_stake'] = $minStake;
+        }
+        if (isset($body['max_stake'])) {
+            $maxStake = strict_positive_amount($body['max_stake'], 'max_stake', $minStake, 10000000.0);
+            $sets[] = 'max_stake = :maxs'; $params[':maxs'] = $maxStake; $changes['max_stake'] = $maxStake;
+        }
+        if ($maxStake < $minStake) { $pdo->rollBack(); fail('max_stake must be >= min_stake.', 422); }
+        if (isset($body['max_total_wagered'])) {
+            $mtw = strict_non_negative_amount($body['max_total_wagered'], 'max_total_wagered', 1000000000.0);
+            $sets[] = 'max_total_wagered = :mtw'; $params[':mtw'] = $mtw; $changes['max_total_wagered'] = $mtw;
+        }
+        if (isset($body['max_odds'])) {
+            if ($m['odds_mode'] !== 'lmsr') { $pdo->rollBack(); fail('max_odds is LMSR-only.', 422); }
+            $mo = strict_positive_amount($body['max_odds'], 'max_odds', 1.5, 1000.0);
+            $sets[] = 'max_odds = :mo'; $params[':mo'] = $mo; $changes['max_odds'] = $mo;
+        }
+        if (empty($sets)) { $pdo->rollBack(); fail('No limits provided.', 422); }
+        $sets[] = 'updated_at = NOW()';
+        $upd = $pdo->prepare("UPDATE markets SET " . implode(', ', $sets) . " WHERE id = :id");
+        $upd->execute($params);
+
+        $pdo->commit();
+        audit_log('adjust_limits', (int)$admin['user_id'], 'market', (int)$m['id'], $changes);
+        ok(['market_id' => $mid, 'changes' => $changes], 'Limits updated');
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) $pdo->rollBack();
+        if ($e instanceof RuntimeException) throw $e;
+        internal_error($e, 'adjust_limits');
+    }
+}
+
+function handle_admin_extend_close_time(array $body): void {
+    $admin = require_admin();
+    require_fields($body, ['market_id', 'close_time']);
+    $mid = validate_market_id($body['market_id']);
+    $newCT = validate_datetime($body['close_time'], 'close_time');
+    if (strtotime($newCT) <= time()) fail('close_time must be in the future.', 422, ['close_time']);
+    $pdo = db();
+    try {
+        $pdo->beginTransaction();
+        $m = _admin_market_lock($pdo, $mid);
+        if (in_array($m['status'], ['resolved', 'voided'], true)) { $pdo->rollBack(); fail('Terminal markets cannot be modified.', 409); }
+        if (!empty($m['close_time']) && strtotime($newCT) <= strtotime($m['close_time'])) {
+            $pdo->rollBack();
+            fail('New close_time must be after current close_time.', 422, ['close_time']);
+        }
+        $upd = $pdo->prepare("UPDATE markets SET close_time = :ct, updated_at = NOW() WHERE id = :id");
+        $upd->execute([':ct' => $newCT, ':id' => $m['id']]);
+        $pdo->commit();
+        audit_log('extend_close_time', (int)$admin['user_id'], 'market', (int)$m['id'], ['from' => $m['close_time'], 'to' => $newCT]);
+        ok(['market_id' => $mid, 'close_time' => $newCT], 'Close time extended');
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) $pdo->rollBack();
+        if ($e instanceof RuntimeException) throw $e;
+        internal_error($e, 'extend_close_time');
+    }
+}
+
+function handle_admin_set_liquidity(array $body): void {
+    $admin = require_admin();
+    require_fields($body, ['market_id', 'b']);
+    $mid = validate_market_id($body['market_id']);
+    $newB = strict_positive_amount($body['b'], 'b', (float)LMSR_B_MIN, (float)LMSR_B_MAX);
+    $pdo = db();
+    try {
+        $pdo->beginTransaction();
+        $m = _admin_market_lock($pdo, $mid);
+        if ($m['odds_mode'] !== 'lmsr') { $pdo->rollBack(); fail('Only LMSR markets have a liquidity parameter.', 422); }
+        if (in_array($m['status'], ['resolved', 'voided'], true)) { $pdo->rollBack(); fail('Terminal markets cannot be modified.', 409); }
+        $oldB = (float)$m['b'];
+        $upd = $pdo->prepare("UPDATE markets SET b = :b, updated_at = NOW() WHERE id = :id");
+        $upd->execute([':b' => $newB, ':id' => $m['id']]);
+        $rows = fetch_market_outcomes((int)$m['id']);
+        $pdo->commit();
+        record_market_snapshot((int)$m['id'], $rows, $newB, (float)$m['total_wagered']);
+        audit_log('set_liquidity', (int)$admin['user_id'], 'market', (int)$m['id'], ['from' => $oldB, 'to' => $newB]);
+        $warning = $oldB !== $newB ? 'Liquidity change will cause an immediate price shift. Existing bets are unaffected (locked at entry odds).' : null;
+        ok(['market_id' => $mid, 'b' => $newB, 'warning' => $warning], 'Liquidity updated');
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) $pdo->rollBack();
+        if ($e instanceof RuntimeException) throw $e;
+        internal_error($e, 'set_liquidity');
+    }
+}
+
+function handle_admin_reseed_odds(array $body): void {
+    $admin = require_admin();
+    require_fields($body, ['market_id', 'outcomes']);
+    $mid = validate_market_id($body['market_id']);
+    if (!is_array($body['outcomes'])) fail('outcomes must be an array.', 422, ['outcomes']);
+    $force = !empty($body['force']);
+    $pdo = db();
+    try {
+        $pdo->beginTransaction();
+        $m = _admin_market_lock($pdo, $mid);
+        if (in_array($m['status'], ['resolved', 'voided'], true)) { $pdo->rollBack(); fail('Terminal markets cannot be modified.', 409); }
+
+        $openBets = $pdo->prepare("SELECT COUNT(*) c FROM bets WHERE market_id = :mid AND status = 'open'");
+        $openBets->execute([':mid' => $m['id']]);
+        $openCount = (int)$openBets->fetch()['c'];
+        if ($openCount > 0 && !$force) {
+            $pdo->rollBack();
+            fail("Cannot reseed: {$openCount} open bets exist. Pass force=true to override.", 409);
+        }
+
+        $oRows = $pdo->prepare("SELECT id, name FROM outcomes WHERE market_id = :mid ORDER BY id ASC FOR UPDATE");
+        $oRows->execute([':mid' => $m['id']]);
+        $existing = $oRows->fetchAll();
+        if (count($body['outcomes']) !== count($existing)) {
+            $pdo->rollBack();
+            fail('You must provide odds for every existing outcome (' . count($existing) . ').', 422, ['outcomes']);
+        }
+        $implied = 0.0;
+        foreach ($body['outcomes'] as $i => $o) {
+            if (!is_array($o)) fail("outcomes[{$i}] must be an object.", 422, ['outcomes']);
+            if (!isset($o['outcome_id'])) fail("outcomes[{$i}].outcome_id required.", 422, ['outcomes']);
+            $oid = strict_positive_int($o['outcome_id'], "outcomes[{$i}].outcome_id");
+            if ((int)$existing[$i]['id'] !== $oid) {
+                $found = false;
+                foreach ($existing as $ex) if ((int)$ex['id'] === $oid) { $found = true; break; }
+                if (!$found) fail("outcome_id {$oid} not in this market.", 422, ['outcomes']);
+            }
+            if (!isset($o['odds'])) fail("outcomes[{$i}].odds required.", 422, ['outcomes']);
+            $odds = strict_positive_amount($o['odds'], "outcomes[{$i}].odds", 1.01, 1000.0);
+            $implied += 1.0 / $odds;
+        }
+
+        if ($m['odds_mode'] === 'fixed') {
+            if ($implied < FIXED_MIN_OVERROUND) {
+                $pdo->rollBack();
+                fail("Fixed market overround too low. Implied probability sum = " . round($implied, 4) . ". Must be >= " . FIXED_MIN_OVERROUND . ".", 422, ['outcomes']);
+            }
+            $oUpd = $pdo->prepare("UPDATE outcomes SET fixed_odds = :fo WHERE id = :oid AND market_id = :mid");
+            foreach ($body['outcomes'] as $o) {
+                $oUpd->execute([':fo' => (float)$o['odds'], ':oid' => (int)$o['outcome_id'], ':mid' => $m['id']]);
+            }
+        } else {
+            $probs = normalize_probs($body['outcomes']);
+            $shares = seed_shares($probs, (float)$m['b']);
+            $oUpd = $pdo->prepare("UPDATE outcomes SET shares = :s, fixed_odds = NULL WHERE id = :oid AND market_id = :mid");
+            foreach ($body['outcomes'] as $i => $o) {
+                $oUpd->execute([':s' => $shares[$i], ':oid' => (int)$o['outcome_id'], ':mid' => $m['id']]);
+            }
+        }
+
+        $upd = $pdo->prepare("UPDATE markets SET updated_at = NOW() WHERE id = :id");
+        $upd->execute([':id' => $m['id']]);
+
+        $rows = fetch_market_outcomes((int)$m['id']);
+        $pdo->commit();
+        record_market_snapshot((int)$m['id'], $rows, (float)$m['b'], (float)$m['total_wagered']);
+        audit_log('reseed_odds', (int)$admin['user_id'], 'market', (int)$m['id'], [
+            'force' => $force, 'open_bets' => $openCount,
+        ]);
+        ok(['market_id' => $mid, 'outcomes' => market_snapshot($rows, (float)$m['b'], (string)$m['odds_mode'])], 'Odds reseeded');
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) $pdo->rollBack();
+        if ($e instanceof RuntimeException) throw $e;
+        internal_error($e, 'reseed_odds');
+    }
+}
+
+function handle_admin_set_odds_mode(array $body): void {
+    $admin = require_admin();
+    require_fields($body, ['market_id', 'odds_mode']);
+    $mid = validate_market_id($body['market_id']);
+    $newMode = validate_enum($body['odds_mode'], ['lmsr', 'fixed'], 'odds_mode');
+    $force = !empty($body['force']);
+    $pdo = db();
+    try {
+        $pdo->beginTransaction();
+        $m = _admin_market_lock($pdo, $mid);
+        if (in_array($m['status'], ['resolved', 'voided'], true)) { $pdo->rollBack(); fail('Terminal markets cannot be modified.', 409); }
+        if ($m['odds_mode'] === $newMode) { $pdo->rollBack(); fail('Market is already in this mode.', 409); }
+
+        $openBets = $pdo->prepare("SELECT COUNT(*) c FROM bets WHERE market_id = :mid AND status = 'open'");
+        $openBets->execute([':mid' => $m['id']]);
+        $openCount = (int)$openBets->fetch()['c'];
+        if ($openCount > 0 && !$force) {
+            $pdo->rollBack();
+            fail("Cannot change odds_mode: {$openCount} open bets exist. Pass force=true to override.", 409);
+        }
+
+        $oRows = $pdo->prepare("SELECT id, name, shares, fixed_odds FROM outcomes WHERE market_id = :mid ORDER BY id ASC FOR UPDATE");
+        $oRows->execute([':mid' => $m['id']]);
+        $outcomes = $oRows->fetchAll();
+
+        if ($newMode === 'fixed') {
+            // Convert LMSR probs to fixed odds (use current probs as fair odds)
+            $b = (float)$m['b'];
+            $shares = array_map(fn($o) => (float)$o['shares'], $outcomes);
+            $probs = lmsr_probs($shares, $b);
+            // Apply 5% margin to ensure overround
+            $margin = 1.05;
+            $oUpd = $pdo->prepare("UPDATE outcomes SET fixed_odds = :fo, shares = 0 WHERE id = :oid");
+            foreach ($outcomes as $i => $o) {
+                $p = $probs[$i] ?? 0.0;
+                if ($p <= 0) { $pdo->rollBack(); fail('Cannot convert: outcome has zero probability.', 422); }
+                $newOdds = round(1.0 / ($p * $margin), 4);
+                if ($newOdds <= 1.01) $newOdds = 1.02;
+                $oUpd->execute([':fo' => $newOdds, ':oid' => (int)$o['id']]);
+            }
+        } else {
+            // Convert fixed odds to LMSR shares
+            $probs = [];
+            foreach ($outcomes as $o) {
+                $fo = (float)$o['fixed_odds'];
+                if ($fo <= 1.0) { $pdo->rollBack(); fail('Cannot convert: outcome has invalid fixed odds.', 422); }
+                $probs[] = 1.0 / $fo;
+            }
+            $sum = array_sum($probs);
+            if ($sum <= 0) { $pdo->rollBack(); fail('Cannot convert: invalid odds.', 422); }
+            $norm = array_map(fn($p) => $p / $sum, $probs);
+            $shares = seed_shares($norm, (float)$m['b']);
+            $oUpd = $pdo->prepare("UPDATE outcomes SET shares = :s, fixed_odds = NULL WHERE id = :oid");
+            foreach ($outcomes as $i => $o) {
+                $oUpd->execute([':s' => $shares[$i], ':oid' => (int)$o['id']]);
+            }
+        }
+
+        $mUpd = $pdo->prepare("UPDATE markets SET odds_mode = :mo, max_odds = :modds, updated_at = NOW() WHERE id = :id");
+        $mUpd->execute([
+            ':mo' => $newMode,
+            ':modds' => $newMode === 'lmsr' ? LMSR_MAX_ODDS : null,
+            ':id' => $m['id'],
+        ]);
+
+        $rows = fetch_market_outcomes((int)$m['id']);
+        $pdo->commit();
+        record_market_snapshot((int)$m['id'], $rows, (float)$m['b'], (float)$m['total_wagered']);
+        audit_log('set_odds_mode', (int)$admin['user_id'], 'market', (int)$m['id'], [
+            'from' => $m['odds_mode'], 'to' => $newMode, 'force' => $force, 'open_bets' => $openCount,
+        ]);
+        ok(['market_id' => $mid, 'odds_mode' => $newMode, 'outcomes' => market_snapshot($rows, (float)$m['b'], $newMode)], 'Odds mode changed');
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) $pdo->rollBack();
+        if ($e instanceof RuntimeException) throw $e;
+        internal_error($e, 'set_odds_mode');
+    }
+}
+
+// ============================================================
+// ADMIN REPORTING
+// ============================================================
+
+function handle_admin_stats(): void {
+    require_admin();
+    $pdo = db();
+
+    $userStats = $pdo->query("SELECT COUNT(*) AS total_users, SUM(is_suspended) AS suspended, SUM(messaging_restricted) AS restricted FROM users")->fetch();
+    $balanceStats = $pdo->query("SELECT COALESCE(SUM(balance),0) AS total_balance, COALESCE(SUM(locked_balance),0) AS total_locked, COALESCE(SUM(bonus_balance),0) AS total_bonus FROM users")->fetch();
+    $marketStats = $pdo->query("SELECT
+        COUNT(*) AS total_markets,
+        SUM(CASE WHEN status='open'     THEN 1 ELSE 0 END) AS open_markets,
+        SUM(CASE WHEN status='paused'   THEN 1 ELSE 0 END) AS paused_markets,
+        SUM(CASE WHEN status='closed'   THEN 1 ELSE 0 END) AS closed_markets,
+        SUM(CASE WHEN status='resolved' THEN 1 ELSE 0 END) AS resolved_markets,
+        SUM(CASE WHEN status='voided'   THEN 1 ELSE 0 END) AS voided_markets
+        FROM markets")->fetch();
+    $betStats = $pdo->query("SELECT
+        COUNT(*) AS total_bets,
+        SUM(CASE WHEN status='open' THEN 1 ELSE 0 END) AS open_bets,
+        SUM(CASE WHEN status='won'  THEN 1 ELSE 0 END) AS won_bets,
+        SUM(CASE WHEN status='lost' THEN 1 ELSE 0 END) AS lost_bets,
+        SUM(CASE WHEN status='void' THEN 1 ELSE 0 END) AS void_bets,
+        COALESCE(SUM(stake),0) AS total_stake,
+        COALESCE(SUM(CASE WHEN status='won' THEN payout ELSE 0 END),0) AS total_payout
+        FROM bets")->fetch();
+    $depositStats = $pdo->query("SELECT
+        COUNT(*) AS total_deposits,
+        SUM(CASE WHEN status='completed' THEN amount ELSE 0 END) AS total_completed,
+        SUM(CASE WHEN status='pending'   THEN 1 ELSE 0 END) AS pending,
+        SUM(CASE WHEN status='failed'    THEN 1 ELSE 0 END) AS failed
+        FROM deposits")->fetch();
+    $withdrawalStats = $pdo->query("SELECT
+        COUNT(*) AS total_withdrawals,
+        SUM(CASE WHEN status='completed' THEN amount ELSE 0 END) AS total_completed,
+        SUM(CASE WHEN status='pending'   THEN 1 ELSE 0 END) AS pending,
+        SUM(CASE WHEN status='rejected'  THEN 1 ELSE 0 END) AS rejected
+        FROM withdrawals")->fetch();
+    $notifs = $pdo->query("SELECT COUNT(*) c FROM notifications WHERE is_read = 0")->fetch();
+    $smsCount = $pdo->query("SELECT COUNT(*) c FROM sms_log WHERE created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)")->fetch();
+
+    ok([
+        'users'        => $userStats,
+        'balances'     => $balanceStats,
+        'markets'      => $marketStats,
+        'bets'         => $betStats,
+        'deposits'     => $depositStats,
+        'withdrawals'  => $withdrawalStats,
+        'unread_alerts'=> (int)$notifs['c'],
+        'sms_30d'      => (int)$smsCount['c'],
+        'generated_at' => gmdate('Y-m-d H:i:s'),
+    ]);
+}
+
+function handle_admin_market_report(): void {
+    require_admin();
+    $mid = validate_market_id($_GET['market_id'] ?? '');
+    $stmt = db()->prepare("SELECT * FROM markets WHERE market_id = :mid LIMIT 1");
+    $stmt->execute([':mid' => $mid]);
+    $m = $stmt->fetch();
+    if (!$m) fail('Market not found.', 404);
+    $rows = fetch_market_outcomes((int)$m['id']);
+    $snap = market_snapshot($rows, (float)$m['b'], (string)$m['odds_mode']);
+
+    $betSum = db()->prepare("SELECT
+        COUNT(*) AS total_bets,
+        SUM(CASE WHEN status='open' THEN 1 ELSE 0 END) AS open_bets,
+        SUM(CASE WHEN status='won'  THEN 1 ELSE 0 END) AS won_bets,
+        SUM(CASE WHEN status='lost' THEN 1 ELSE 0 END) AS lost_bets,
+        SUM(CASE WHEN status='void' THEN 1 ELSE 0 END) AS void_bets,
+        COALESCE(SUM(stake),0) AS total_stake,
+        COALESCE(SUM(CASE WHEN status='won' THEN payout ELSE 0 END),0) AS total_payout
+        FROM bets WHERE market_id = :mid");
+    $betSum->execute([':mid' => $m['id']]);
+    $bs = $betSum->fetch();
+
+    $volByOutcome = db()->prepare("SELECT outcome_id, COUNT(*) AS bets, COALESCE(SUM(stake),0) AS volume
+        FROM bets WHERE market_id = :mid AND status != 'void' GROUP BY outcome_id");
+    $volByOutcome->execute([':mid' => $m['id']]);
+    $vols = $volByOutcome->fetchAll();
+    $volMap = [];
+    foreach ($vols as $v) $volMap[(int)$v['outcome_id']] = ['bets' => (int)$v['bets'], 'volume' => (float)$v['volume']];
+
+    $outcomesWithVol = [];
+    foreach ($snap as $s) {
+        $oid = (int)$s['outcome_id'];
+        $s['bets'] = $volMap[$oid]['bets'] ?? 0;
+        $s['volume'] = $volMap[$oid]['volume'] ?? 0.0;
+        $outcomesWithVol[] = $s;
+    }
+
+    // Graph summary — bulk fetch first/last snapshot per outcome
+    $graphStmt = db()->prepare("SELECT outcome_id,
+        MIN(created_at) AS first_at, MAX(created_at) AS last_at,
+        COUNT(*) AS samples
+        FROM market_snapshots WHERE market_id = :mid GROUP BY outcome_id");
+    $graphStmt->execute([':mid' => $m['id']]);
+    $graphRows = $graphStmt->fetchAll();
+
+    $auditStmt = db()->prepare("SELECT id, admin_id, action, meta, created_at FROM audit_logs WHERE target_type = 'market' AND target_id = :id ORDER BY created_at DESC LIMIT 50");
+    $auditStmt->execute([':id' => $m['id']]);
+    $audit = $auditStmt->fetchAll();
+    foreach ($audit as &$a) {
+        $a['meta'] = $a['meta'] ? json_decode($a['meta'], true) : null;
+    }
+    unset($a);
+
+    ok([
+        'market'    => public_market_row($m, $outcomesWithVol),
+        'odds_mode' => $m['odds_mode'],
+        'b'         => (float)$m['b'],
+        'max_odds'  => $m['max_odds'] !== null ? (float)$m['max_odds'] : null,
+        'pause_reason' => $m['pause_reason'],
+        'bet_summary' => [
+            'total_bets'   => (int)$bs['total_bets'],
+            'open_bets'    => (int)$bs['open_bets'],
+            'won_bets'     => (int)$bs['won_bets'],
+            'lost_bets'    => (int)$bs['lost_bets'],
+            'void_bets'    => (int)$bs['void_bets'],
+            'total_stake'  => (float)$bs['total_stake'],
+            'total_payout' => (float)$bs['total_payout'],
+        ],
+        'graph_summary' => $graphRows,
+        'audit_log'     => $audit,
+    ]);
+}
