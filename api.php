@@ -17,6 +17,7 @@ require_once __DIR__ . '/messages_api.php';
 require_once __DIR__ . '/social_api.php';
 require_once __DIR__ . '/payments_api.php';
 require_once __DIR__ . '/admin_api.php';
+require_once __DIR__ . '/support_api.php';
 
 // Request ID — propagate inbound or generate. Tag the response + error log.
 $REQUEST_ID = $_SERVER['HTTP_X_REQUEST_ID'] ?? '';
@@ -133,6 +134,7 @@ if ($ROUTE === 'routes') {
         ['admin_void_bets_by_time',        'POST', 'admin',  'Void all open bets after cutoff'],
         ['admin_void_bet',                 'POST', 'admin',  'Void a single open bet'],
         ['admin_archive_market',           'POST', 'admin',  'Archive/unarchive resolved/voided market'],
+        ['admin_feature_market',           'POST', 'admin',  'Feature/unfeature a market (pins to top)'],
         ['admin_edit_market',              'POST', 'admin',  'Edit question/category/source/title/image'],
         ['admin_adjust_limits',            'POST', 'admin',  'Stake / wager cap / max_odds limits'],
         ['admin_extend_close_time',        'POST', 'admin',  'Push close deadline forward'],
@@ -166,6 +168,15 @@ if ($ROUTE === 'routes') {
         ['admin_approve_manual_claim',     'POST', 'admin',  'Approve a manual claim and credit'],
         ['admin_reject_manual_claim',      'POST', 'admin',  'Reject a manual claim'],
         ['admin_deposit_pause',            'POST', 'admin',  'Pause/resume deposits (GET to read)'],
+        ['support_create',                 'POST', 'user',   'Open a support ticket / suggestion'],
+        ['support_tickets',                'GET',  'user',   'List own support tickets'],
+        ['support_thread',                 'GET',  'user',   'Read own ticket thread'],
+        ['support_reply',                  'POST', 'user',   'Reply on own ticket'],
+        ['support_close',                  'POST', 'user',   'Close own ticket'],
+        ['admin_support_tickets',          'GET',  'admin',  'List all tickets (filter status/category/unread)'],
+        ['admin_support_thread',           'GET',  'admin',  'Read a ticket thread'],
+        ['admin_support_reply',            'POST', 'admin',  'Reply privately to one user'],
+        ['admin_support_close',            'POST', 'admin',  'Close a ticket'],
         ['admin_send_sms',                 'POST', 'admin',  'Send SMS to user or broadcast'],
         ['admin_sms_history',              'GET',  'admin',  'View sent SMS log'],
         ['admin_ban_user',                 'POST', 'admin',  'Full account ban'],
@@ -225,6 +236,7 @@ try {
         case 'admin_void_bets_by_time':    handle_admin_void_bets_by_time($BODY); break;
         case 'admin_void_bet':             handle_admin_void_bet($BODY); break;
         case 'admin_archive_market':       handle_admin_archive_market($BODY); break;
+        case 'admin_feature_market':       handle_admin_feature_market($BODY); break;
         case 'admin_edit_market':          handle_admin_edit_market($BODY); break;
         case 'admin_adjust_limits':        handle_admin_adjust_limits($BODY); break;
         case 'admin_extend_close_time':    handle_admin_extend_close_time($BODY); break;
@@ -262,6 +274,17 @@ try {
         case 'admin_approve_manual_claim': handle_admin_approve_manual_claim($BODY); break;
         case 'admin_reject_manual_claim':  handle_admin_reject_manual_claim($BODY); break;
         case 'admin_deposit_pause':        handle_admin_deposit_pause($BODY); break;
+
+        // Support / contact (user <-> admin private)
+        case 'support_create':                handle_support_create($BODY); break;
+        case 'support_tickets':               handle_support_tickets(); break;
+        case 'support_thread':                handle_support_thread(); break;
+        case 'support_reply':                 handle_support_reply($BODY); break;
+        case 'support_close':                 handle_support_close($BODY); break;
+        case 'admin_support_tickets':         handle_admin_support_tickets(); break;
+        case 'admin_support_thread':          handle_admin_support_thread(); break;
+        case 'admin_support_reply':           handle_admin_support_reply($BODY); break;
+        case 'admin_support_close':           handle_admin_support_close($BODY); break;
 
         // Admin — SMS, user controls, maintenance, notifications
         case 'admin_send_sms':                handle_admin_send_sms($BODY); break;

@@ -82,6 +82,7 @@ CREATE TABLE IF NOT EXISTS markets (
     total_bets        INT UNSIGNED  NOT NULL DEFAULT 0,
     total_wagered     DECIMAL(20,2) NOT NULL DEFAULT 0.00,
     is_archived       TINYINT(1) NOT NULL DEFAULT 0,
+    is_featured       TINYINT(1) NOT NULL DEFAULT 0,
     created_by        BIGINT UNSIGNED NULL,
     created_at        DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at        DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -91,6 +92,7 @@ CREATE TABLE IF NOT EXISTS markets (
     KEY idx_category          (category),
     KEY idx_close_time        (close_time),
     KEY idx_is_archived       (is_archived),
+    KEY idx_is_featured       (is_featured),
     KEY idx_status_archived   (status, is_archived),
     CONSTRAINT fk_markets_creator FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL,
     CONSTRAINT chk_markets_b           CHECK (b >= 1),
@@ -460,6 +462,44 @@ CREATE TABLE IF NOT EXISTS manual_deposit_claims (
     CONSTRAINT fk_mdc_user  FOREIGN KEY (user_id)     REFERENCES users(id),
     CONSTRAINT fk_mdc_admin FOREIGN KEY (reviewed_by) REFERENCES users(id) ON DELETE SET NULL,
     CONSTRAINT chk_mdc_amt CHECK (amount > 0)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ============================================================
+-- 22. support_tickets  (user <-> admin private support / suggestions)
+-- ============================================================
+CREATE TABLE IF NOT EXISTS support_tickets (
+    id              BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    user_id         BIGINT UNSIGNED NOT NULL,
+    category        ENUM('issue','suggestion','market_suggestion','payment','account','other') NOT NULL DEFAULT 'other',
+    subject         VARCHAR(150) NOT NULL,
+    status          ENUM('open','answered','closed') NOT NULL DEFAULT 'open',
+    market_id       BIGINT UNSIGNED NULL,
+    user_unread     INT UNSIGNED NOT NULL DEFAULT 0,   -- replies the user has not read
+    admin_unread    INT UNSIGNED NOT NULL DEFAULT 1,   -- messages the admin has not read
+    last_message_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (id),
+    KEY idx_user_status   (user_id, status),
+    KEY idx_status_recent (status, last_message_at),
+    KEY idx_market        (market_id),
+    CONSTRAINT fk_ticket_user   FOREIGN KEY (user_id)   REFERENCES users(id)   ON DELETE CASCADE,
+    CONSTRAINT fk_ticket_market FOREIGN KEY (market_id) REFERENCES markets(id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ============================================================
+-- 23. support_messages
+-- ============================================================
+CREATE TABLE IF NOT EXISTS support_messages (
+    id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    ticket_id   BIGINT UNSIGNED NOT NULL,
+    sender_id   BIGINT UNSIGNED NOT NULL,
+    sender_role ENUM('user','admin') NOT NULL,
+    body        TEXT NOT NULL,
+    created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (id),
+    KEY idx_ticket_created (ticket_id, created_at),
+    CONSTRAINT fk_smsg_ticket FOREIGN KEY (ticket_id) REFERENCES support_tickets(id) ON DELETE CASCADE,
+    CONSTRAINT fk_smsg_sender FOREIGN KEY (sender_id) REFERENCES users(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 SET FOREIGN_KEY_CHECKS = 1;

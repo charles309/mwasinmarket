@@ -204,7 +204,7 @@ function handle_submit_manual_claim(array $body): void {
 function handle_withdrawal_request(array $body): void {
     $auth = require_auth();
     require_fields($body, ['amount', 'phone']);
-    $amount = strict_positive_amount($body['amount'], 'amount', 10.0, 150000.0);
+    $amount = strict_positive_amount($body['amount'], 'amount', WITHDRAWAL_MIN, WITHDRAWAL_MAX);
     $phone  = validate_phone_ke($body['phone']);
 
     $pdo = db();

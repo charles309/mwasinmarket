@@ -194,7 +194,7 @@ function fetch_market_outcomes(int $marketId): array {
     return $stmt->fetchAll();
 }
 
-function public_market_row(array $m, array $outcomes): array {
+function public_market_row(array $m, array $outcomes, int $totalHearts = 0): array {
     return [
         'id'                => 'pm_' . $m['market_id'],
         'market_id'         => $m['market_id'],
@@ -213,10 +213,23 @@ function public_market_row(array $m, array $outcomes): array {
         'max_total_wagered' => (float)$m['max_total_wagered'],
         'total_bets'        => (int)$m['total_bets'],
         'total_wagered'     => (float)$m['total_wagered'],
+        'total_hearts'      => $totalHearts,
         'is_archived'       => (bool)$m['is_archived'],
+        'is_featured'       => (bool)($m['is_featured'] ?? 0),
         'outcomes'          => $outcomes,
         'created_at'        => $m['created_at'],
     ];
+}
+
+/** Bulk heart counts for a set of internal market ids → [marketId => count]. */
+function hearts_for_markets(array $marketIds): array {
+    if (empty($marketIds)) return [];
+    $ph = implode(',', array_fill(0, count($marketIds), '?'));
+    $stmt = db()->prepare("SELECT market_id, COUNT(*) c FROM reactions WHERE reaction='heart' AND market_id IN ({$ph}) GROUP BY market_id");
+    $stmt->execute(array_map('intval', $marketIds));
+    $out = [];
+    foreach ($stmt->fetchAll() as $r) $out[(int)$r['market_id']] = (int)$r['c'];
+    return $out;
 }
 
 // ============================================================
@@ -261,12 +274,30 @@ function handle_markets_list(): void {
     } else {
         fail('Invalid status filter.', 422);
     }
-    if (!$includeResolved && $status === 'active') {
-        // already excluded
-    }
     if (!$includeArchived) {
         $where[] = 'is_archived = 0';
     }
+    if (!empty($_GET['featured'])) {
+        $where[] = 'is_featured = 1';
+    }
+    // Free-text search on the question/title (parameterised LIKE — no injection).
+    if (isset($_GET['q']) && trim((string)$_GET['q']) !== '') {
+        $q = trim((string)$_GET['q']);
+        if (mb_strlen($q, 'UTF-8') > 100) $q = mb_substr($q, 0, 100, 'UTF-8');
+        $where[] = '(question LIKE :q OR title LIKE :q)';
+        $params[':q'] = '%' . str_replace(['%', '_'], ['\%', '\_'], $q) . '%';
+    }
+
+    // Sort: featured first always, then the chosen order.
+    $sort = $_GET['sort'] ?? 'newest';
+    $orderMap = [
+        'newest'       => 'created_at DESC',
+        'closing_soon' => 'close_time IS NULL ASC, close_time ASC',
+        'volume'       => 'total_wagered DESC',
+        'popular'      => 'total_bets DESC',
+    ];
+    if (!isset($orderMap[$sort])) fail('Invalid sort.', 422, ['sort']);
+    $orderSql = 'is_featured DESC, ' . $orderMap[$sort];
 
     $whereSql = !empty($where) ? 'WHERE ' . implode(' AND ', $where) : '';
 
@@ -274,7 +305,7 @@ function handle_markets_list(): void {
     $countStmt->execute($params);
     $total = (int)$countStmt->fetch()['c'];
 
-    $sql = "SELECT * FROM markets {$whereSql} ORDER BY created_at DESC LIMIT :lim OFFSET :off";
+    $sql = "SELECT * FROM markets {$whereSql} ORDER BY {$orderSql} LIMIT :lim OFFSET :off";
     $stmt = db()->prepare($sql);
     foreach ($params as $k => $v) $stmt->bindValue($k, $v);
     $stmt->bindValue(':lim', $limit, PDO::PARAM_INT);
@@ -296,17 +327,18 @@ function handle_markets_list(): void {
     foreach ($outRows as $o) {
         $byMarket[(int)$o['market_id']][] = $o;
     }
+    $heartMap = hearts_for_markets($marketIds);
 
     $result = [];
     foreach ($markets as $m) {
         $rows = $byMarket[(int)$m['id']] ?? [];
         $snap = market_snapshot($rows, (float)$m['b'], (string)$m['odds_mode']);
-        $result[] = public_market_row($m, $snap);
+        $result[] = public_market_row($m, $snap, $heartMap[(int)$m['id']] ?? 0);
     }
 
     ok([
         'data' => $result,
-        'meta' => ['total' => $total, 'page' => $page, 'limit' => $limit, 'pages' => (int)ceil($total / $limit)],
+        'meta' => ['total' => $total, 'page' => $page, 'limit' => $limit, 'pages' => (int)ceil($total / $limit), 'sort' => $sort],
     ]);
 }
 
@@ -319,7 +351,8 @@ function handle_market_single(): void {
     if (!$m) fail('Market not found.', 404);
     $rows = fetch_market_outcomes((int)$m['id']);
     $snap = market_snapshot($rows, (float)$m['b'], (string)$m['odds_mode']);
-    ok(public_market_row($m, $snap));
+    $hearts = hearts_for_markets([(int)$m['id']]);
+    ok(public_market_row($m, $snap, $hearts[(int)$m['id']] ?? 0));
 }
 
 function handle_market_history(): void {
@@ -1259,6 +1292,28 @@ function handle_admin_archive_market(array $body): void {
         if ($pdo->inTransaction()) $pdo->rollBack();
         if ($e instanceof RuntimeException) throw $e;
         internal_error($e, 'archive_market');
+    }
+}
+
+function handle_admin_feature_market(array $body): void {
+    $admin = require_admin();
+    require_fields($body, ['market_id']);
+    $mid = validate_market_id($body['market_id']);
+    $feature = array_key_exists('featured', $body) ? (bool)$body['featured'] : true;
+    $pdo = db();
+    try {
+        $pdo->beginTransaction();
+        $m = _admin_market_lock($pdo, $mid);
+        $val = $feature ? 1 : 0;
+        $upd = $pdo->prepare("UPDATE markets SET is_featured = :v, updated_at=NOW() WHERE id=:id");
+        $upd->execute([':v' => $val, ':id' => $m['id']]);
+        $pdo->commit();
+        audit_log('feature_market', (int)$admin['user_id'], 'market', (int)$m['id'], ['featured' => (bool)$val]);
+        ok(['market_id' => $mid, 'is_featured' => (bool)$val], $val ? 'Market featured' : 'Market unfeatured');
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) $pdo->rollBack();
+        if ($e instanceof RuntimeException) throw $e;
+        internal_error($e, 'feature_market');
     }
 }
 

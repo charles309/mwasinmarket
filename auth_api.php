@@ -27,7 +27,15 @@ function handle_register(array $body): void {
         INSERT INTO users (username, email, phone, full_name, password_hash, role, balance, locked_balance, bonus_balance, created_at, updated_at)
         VALUES (:u, :e, :p, :fn, :h, 'user', 0, 0, 0, NOW(), NOW())
     ");
-    $ins->execute([':u' => $username, ':e' => $email, ':p' => $phone, ':fn' => $fullName, ':h' => $hash]);
+    try {
+        $ins->execute([':u' => $username, ':e' => $email, ':p' => $phone, ':fn' => $fullName, ':h' => $hash]);
+    } catch (PDOException $e) {
+        // Unique-constraint race between the check above and this insert.
+        if ((int)($e->errorInfo[1] ?? 0) === 1062) {
+            fail('A user with that username, email, or phone already exists.', 409);
+        }
+        throw $e;
+    }
     $userId = (int)db()->lastInsertId();
     clear_rate_limit_attempt();
     $token = issue_token($userId);

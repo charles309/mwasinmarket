@@ -23,7 +23,8 @@
 | `payment_stk_deposit.php` | PayHero STK push library (called by `payments_api.php`). |
 | `payment_callback.php` | **Standalone** PayHero callback receiver (its own URL; no bearer auth). |
 | `admin_api.php` | Admin SMS, user controls, maintenance, notifications. |
-| `schema.sql` | 21 InnoDB tables. |
+| `support_api.php` | Private user↔admin support tickets / market suggestions. |
+| `schema.sql` | 23 InnoDB tables. |
 
 > **What changed vs v5.x single file:**
 > - Split into the modules above — easier to edit; `api.php` is now just the router.
@@ -343,9 +344,14 @@ curl "https://yourdomain.com/api.php?route=markets&limit=10&page=2"
 | category         | (all)    | any string                                             |
 | source           | (all)    | source label                                           |
 | market_type      | (all)    | `binary` `categorical`                                 |
+| q                | (none)   | free-text search on question/title (safe LIKE)         |
+| sort             | newest   | `newest` `closing_soon` `volume` `popular`             |
+| featured         | `0`      | `1` returns only featured markets                      |
 | include_resolved | `0`      | `1` includes resolved/voided                           |
 | include_archived | `0`      | `1` includes archived                                  |
 | page, limit      | 1, 20    |                                                        |
+
+Featured markets are pinned to the top regardless of `sort`. Each market row also carries `is_featured` (bool) and `total_hearts` (int). Example: `?route=markets&sort=closing_soon&q=newcastle`.
 
 ```json
 {
@@ -615,6 +621,14 @@ curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: applicati
 curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
   -d '{ "market_id": "a1b2c3d4e5f67890", "question": "Updated?", "category": "sports" }' \
   "https://yourdomain.com/api.php?route=admin_edit_market"
+```
+
+### Feature / unfeature a market
+Featured markets are pinned to the top of `?route=markets` for every sort.
+```bash
+curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{ "market_id": "a1b2c3d4e5f67890", "featured": true }' \
+  "https://yourdomain.com/api.php?route=admin_feature_market"
 ```
 
 ---
@@ -1117,6 +1131,63 @@ curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: applicati
 
 ---
 
+## 16b. Support / contact (user ↔ admin, private)
+
+A private 1:1 thread between a user and the admin team — for issues, account/payment
+problems, or **market suggestions**. No user can ever see another user's ticket; admins
+reply privately to one user.
+
+### User
+```bash
+# Open a ticket (category: issue | suggestion | market_suggestion | payment | account | other)
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{ "category": "market_suggestion", "subject": "Add a market for the Nairobi derby",
+        "body": "Please open a market for Gor vs AFC on Sunday.", "market_id": "a1b2c3d4e5f67890" }' \
+  "https://yourdomain.com/api.php?route=support_create"
+# (market_id is optional — include it to reference an existing market)
+
+# List own tickets (each shows `unread` = replies waiting for you)
+curl -H "Authorization: Bearer $TOKEN" "https://yourdomain.com/api.php?route=support_tickets"
+
+# Read a thread (clears your unread counter)
+curl -H "Authorization: Bearer $TOKEN" "https://yourdomain.com/api.php?route=support_thread&ticket_id=7"
+
+# Reply on your ticket
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{ "ticket_id": 7, "body": "Any update on this?" }' \
+  "https://yourdomain.com/api.php?route=support_reply"
+
+# Close your ticket
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{ "ticket_id": 7 }' \
+  "https://yourdomain.com/api.php?route=support_close"
+```
+
+### Admin
+```bash
+# List tickets (filters: status=open|answered|closed|all, category=..., unread=1). Unread float to top.
+curl -H "Authorization: Bearer $ADMIN_TOKEN" \
+  "https://yourdomain.com/api.php?route=admin_support_tickets&status=open&unread=1"
+
+# Read a thread (clears admin unread; includes the user's contact block)
+curl -H "Authorization: Bearer $ADMIN_TOKEN" \
+  "https://yourdomain.com/api.php?route=admin_support_thread&ticket_id=7"
+
+# Reply privately to that one user (optionally SMS-notify them)
+curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{ "ticket_id": 7, "body": "Thanks — the market is now live.", "notify_sms": true }' \
+  "https://yourdomain.com/api.php?route=admin_support_reply"
+
+# Close a ticket
+curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{ "ticket_id": 7, "note": "Resolved" }' \
+  "https://yourdomain.com/api.php?route=admin_support_close"
+```
+Thread message shape: `{ message_id, sender_id, sender: "user"|"admin", username, body, sent_at }`.
+A user replying reopens the ticket to `open`; an admin reply sets it to `answered`.
+
+---
+
 ## 17. Maintenance mode
 
 ```bash
@@ -1367,7 +1438,7 @@ memory_limit = 128M
 
 ## 26. Database schema overview
 
-Twenty-one InnoDB tables. All `utf8mb4_unicode_ci`. Run `schema.sql` once on a fresh MySQL 8.0+ database.
+Twenty-three InnoDB tables. All `utf8mb4_unicode_ci`. Run `schema.sql` once on a fresh MySQL 8.0+ database.
 
 | #  | Table                          | Purpose                                                |
 |----|--------------------------------|--------------------------------------------------------|
@@ -1392,5 +1463,7 @@ Twenty-one InnoDB tables. All `utf8mb4_unicode_ci`. Run `schema.sql` once on a f
 | 19 | `email_verification_tokens`    | 24 h tokens for email verification                     |
 | 20 | `password_reset_tokens`        | 1 h tokens for password reset                          |
 | 21 | `manual_deposit_claims`        | User-submitted M-Pesa codes for admin verification     |
+| 22 | `support_tickets`              | Private user↔admin threads (issues, market suggestions) |
+| 23 | `support_messages`             | Messages within a support ticket                       |
 
 All FK with sensible `ON DELETE` (CASCADE for child-of-account, SET NULL for nullable references). CHECK constraints prevent negative balances. Every column that's filtered or sorted in code has an explicit index.
