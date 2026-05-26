@@ -1,22 +1,38 @@
 # MwasinMarket — Complete cURL Reference
 
-**Version:** 5.2 (single-file production build)
-**File:** drop `api.php` into webroot. Apply `schema.sql` to MySQL 8.0+.
-**Base URL:** `https://yourdomain.com/api.php`
+**Version:** 5.4 (multi-file production build)
+**Base URL (routes):** `https://yourdomain.com/api.php?route=<name>`
+**Payment callback URL:** `https://yourdomain.com/payment_callback.php` (PayHero posts here — set as `PAYHERO_CALLBACK_URL`)
 **Routing:** `?route=<name>` (query string)
 **Auth:** `Authorization: Bearer <64-hex-token>` (only where stated)
 **Body:** JSON, `Content-Type: application/json`. Max **64 KB**.
 **Discovery:** `GET ?route=routes` returns the live catalogue of every route.
 
-> **What changed vs v4.6:**
-> - Internal fields (`odds_mode`, `max_odds`, `pause_reason`, `b`) are hidden from public market responses (admin reports still expose them).
-> - `login` accepts `username`, `email`, `phone`, or generic `identifier`.
-> - `market_history` is grouped by outcome with `series` arrays.
-> - `admin_stats` and `admin_market_report` are restructured into nested dashboard blocks.
-> - `admin_reseed_odds` accepts outcomes by `name` OR `outcome_id`.
-> - New routes: `routes`, `request_email_verification`, `verify_email`, `request_password_reset`, `reset_password`, plus the full M-Pesa, SMS, sticker, reactions, messaging, ban, and maintenance suites.
-> - Every response now carries an `X-Request-ID` header (echoed from `X-Request-ID` request header if you supply a valid one) for log correlation.
-> - HSTS + `X-Frame-Options: DENY` + `Permissions-Policy` headers on HTTPS.
+### File layout
+
+| File | Role |
+|------|------|
+| `api.php` | Entry point / router. Loads everything below, dispatches `?route=`. |
+| `config.php` | Env vars + constants. |
+| `bootstrap.php` | DB, response helpers, auth, validators, rate limiting, audit/ledger, SMTP, SMS, math-captcha, phone helpers, user vetting, chat purge. |
+| `auth_api.php` | register / login / admin_login / logout / profile / my_bets / health / email verify / password reset. |
+| `markets_api.php` | LMSR engine, public market routes, betting, admin market lifecycle/odds, reports. |
+| `messages_api.php` | **Market chat** (per-market; no DMs; auto-purged on resolve/void). |
+| `social_api.php` | Reactions + stickers. |
+| `payments_api.php` | Deposits (PayHero STK), withdrawals, manual claims, deposit-pause, admin payment routes. |
+| `payment_stk_deposit.php` | PayHero STK push library (called by `payments_api.php`). |
+| `payment_callback.php` | **Standalone** PayHero callback receiver (its own URL; no bearer auth). |
+| `admin_api.php` | Admin SMS, user controls, maintenance, notifications. |
+| `schema.sql` | 21 InnoDB tables. |
+
+> **What changed vs v5.x single file:**
+> - Split into the modules above — easier to edit; `api.php` is now just the router.
+> - **Deposits use PayHero** STK Push. A mandatory **math captcha** + per-user STK rate limit guard against prompt-spam (protects your API key and the customer's MSISDN). Confirmation arrives at the separate `payment_callback.php`.
+> - **Withdrawals are manual**: `admin_approve_withdrawal` now requires the **`transaction_code`** (the M-Pesa receipt you used to pay the user).
+> - **Manual deposit claims**: users can submit an M-Pesa code if the callback never confirmed; admin verifies and credits.
+> - **Deposit pause**: admins can pause deposits independently of full maintenance mode.
+> - **Chat is market-scoped only — there are NO user-to-user DMs.** Chats auto-delete when a market is settled or voided.
+> - `payment_history` lets users see all their deposits + withdrawals.
 
 ---
 
@@ -31,10 +47,10 @@
 7.  [Admin — Market lifecycle](#7-admin--market-lifecycle)
 8.  [Admin — Odds & pricing](#8-admin--odds--pricing)
 9.  [Admin — Reporting](#9-admin--reporting)
-10. [Payments — M-Pesa](#10-payments--mpesa)
+10. [Payments — PayHero M-Pesa](#10-payments--payhero-mpesa)
 11. [Admin — Users & finance](#11-admin--users--finance)
 12. [Social — Reactions](#12-social--reactions)
-13. [Social — Messages](#13-social--messages)
+13. [Social — Market Chat](#13-social--market-chat)
 14. [Social — Stickers](#14-social--stickers)
 15. [Social — SMS](#15-social--sms)
 16. [Admin — User controls](#16-admin--user-controls)
@@ -62,7 +78,7 @@ curl "https://yourdomain.com/api.php"
   "success": true,
   "data": {
     "name": "MwasinMarket API",
-    "version": "5.2",
+    "version": "5.4",
     "time": "2026-05-23 10:00:00 UTC",
     "status": "online",
     "docs": "?route=routes"
@@ -723,16 +739,61 @@ curl -H "Authorization: Bearer $ADMIN_TOKEN" \
 
 ---
 
-## 10. Payments — M-Pesa
+## 10. Payments — PayHero M-Pesa
 
-### Initiate deposit (STK Push)
-Auth required. Amount **10–300,000 KES**. Phone `^\+254\d{9}$`.
+Deposit flow: **(1)** get a captcha → **(2)** STK push → **(3)** PayHero calls `payment_callback.php` → balance credited.
+
+### Step 1 — Get a deposit captcha
+Auth required. Mandatory before every deposit — blocks STK-prompt spam.
+```bash
+curl -H "Authorization: Bearer $TOKEN" \
+  "https://yourdomain.com/api.php?route=deposit_captcha"
+```
+```json
+{
+  "success": true,
+  "message": "Solve the math challenge, then send captcha_token + captcha_answer with your deposit.",
+  "data": { "question": "7 + 3 = ?", "token": "1748037600.a1b2c3d4e5f60718.<hmac>", "expires_in": 300 }
+}
+```
+The token is a stateless HMAC — no server session. It expires in 5 minutes.
+
+### Step 2 — Initiate deposit (PayHero STK Push)
+Auth required. Amount **10–300,000 KES**. Phone `^\+254\d{9}$`. Per user: max **3 pending** prompts / 10 min.
 ```bash
 curl -X POST "https://yourdomain.com/api.php?route=deposit_request" \
   -H "Content-Type: application/json" -H "Authorization: Bearer $TOKEN" \
-  -d '{ "amount": 500, "phone": "+254712345678" }'
+  -d '{
+    "amount": 500,
+    "phone": "+254712345678",
+    "captcha_token": "1748037600.a1b2c3d4e5f60718.<hmac>",
+    "captcha_answer": 10
+  }'
 ```
-Response includes `checkout_request_id` — poll the next route.
+```json
+{
+  "success": true,
+  "message": "Deposit initiated",
+  "data": {
+    "deposit_id": 41,
+    "client_reference": "MWDEP3F9A2B7C1D",
+    "checkout_request_id": "ws_CO_23052026235729085799482566",
+    "amount": 500.00,
+    "phone": "+254712345678",
+    "status": "pending",
+    "message": "Check your phone for the M-Pesa prompt and enter your PIN."
+  }
+}
+```
+Errors: `422` captcha wrong/expired or bad amount/phone · `429` too many pending prompts · `502` PayHero unreachable · `503` deposits paused.
+
+### Step 3 — PayHero callback (PayHero → you)
+PayHero POSTs the result to `payment_callback.php` (a **separate file**, not a `?route=`). Configure it as `PAYHERO_CALLBACK_URL`. It:
+- matches the deposit by `ExternalReference` (= our `client_reference`) or `CheckoutRequestID`,
+- on success credits the balance and stores the `MpesaReceiptNumber` (UNIQUE — duplicate callbacks are no-ops),
+- always returns `HTTP 200`.
+
+Optional security: set `PAYHERO_CALLBACK_SECRET`; PayHero (or your proxy) must then include it as `?s=<secret>` or header `X-Callback-Secret`.
 
 ### Poll deposit status
 ```bash
@@ -740,16 +801,38 @@ curl -H "Authorization: Bearer $TOKEN" \
   "https://yourdomain.com/api.php?route=payment_status&checkout_request_id=ws_CO_..."
 ```
 
+### Payment history (deposits + withdrawals)
+```bash
+curl -H "Authorization: Bearer $TOKEN" \
+  "https://yourdomain.com/api.php?route=payment_history&page=1&limit=20"
+```
+```json
+{
+  "success": true,
+  "data": [
+    { "id": 41, "kind": "deposit", "amount": 500.00, "phone": "+254712345678", "status": "completed", "reference": "SAE3YULR0Y", "note": "PayHero deposit", "created_at": "2026-05-23 23:57:00" },
+    { "id": 12, "kind": "withdrawal", "amount": 1000.00, "phone": "+254712345678", "status": "completed", "reference": "SXY9ABCD12", "note": null, "created_at": "2026-05-20 10:00:00" }
+  ],
+  "meta": { "total": 2, "page": 1, "limit": 20, "pages": 1 }
+}
+```
+
+### Submit a manual deposit claim
+For when PayHero/your server was down but M-Pesa took the money. The user enters the confirmation code; an admin verifies and credits.
+```bash
+curl -X POST "https://yourdomain.com/api.php?route=submit_manual_claim" \
+  -H "Content-Type: application/json" -H "Authorization: Bearer $TOKEN" \
+  -d '{ "amount": 500, "phone": "+254712345678", "transaction_code": "SAE3YULR0Y", "note": "STK timed out but I was debited" }'
+```
+The `transaction_code` is globally unique — a code already credited (via deposit or another claim) is rejected with `409`.
+
 ### Request withdrawal
-Auth required. Amount **10–150,000 KES**. Locks balance immediately; an SMS confirmation is sent.
+Auth required. Amount **10–150,000 KES**. Locks balance immediately; an SMS confirmation is sent. Disbursement is **manual** — see admin approve below.
 ```bash
 curl -X POST "https://yourdomain.com/api.php?route=withdrawal_request" \
   -H "Content-Type: application/json" -H "Authorization: Bearer $TOKEN" \
   -d '{ "amount": 500, "phone": "+254712345678" }'
 ```
-
-### M-Pesa webhook (Safaricom → us)
-No bearer auth — protected by Safaricom **IP allowlist** (`MPESA_IP_WHITELIST`) and optional `X-Mpesa-Secret` header (`MPESA_WEBHOOK_SECRET`). Always responds `HTTP 200` with `{"ResultCode":0,"ResultDesc":"Accepted"}` regardless of internal outcome.
 
 ---
 
@@ -829,29 +912,30 @@ curl -H "Authorization: Bearer $ADMIN_TOKEN" \
 }
 ```
 
-### Approve withdrawal
-The response includes the same full `user` vetting block, plus the B2C disbursement result.
+### Approve withdrawal (manual — record the M-Pesa code)
+You pay the user from your own M-Pesa, then record the resulting receipt as `transaction_code`. It is validated (`^[A-Z0-9]{8,20}$`) and must be unique across withdrawals. The response includes the full `user` vetting block.
 ```bash
 curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
-  -d '{ "withdrawal_id": 5, "note": "Verified KYC" }' \
+  -d '{ "withdrawal_id": 5, "transaction_code": "SXY9ABCD12", "note": "Verified KYC, paid via Till" }' \
   "https://yourdomain.com/api.php?route=admin_approve_withdrawal"
 ```
 ```json
 {
   "success": true,
-  "message": "Withdrawal approved",
+  "message": "Withdrawal approved and marked paid",
   "data": {
     "withdrawal_id": 5,
     "status": "completed",
     "amount": 1500.00,
     "phone": "+254712345678",
+    "transaction_code": "SXY9ABCD12",
     "approved_at": "2026-05-23 10:20:00",
-    "note": "Verified KYC",
-    "b2c": { "ok": true, "conversation_id": "AG_20260523_..." },
+    "note": "Verified KYC, paid via Till",
     "user": { "user_id": 5, "username": "charles", "balance": 300.00, "...": "(full vetting block)" }
   }
 }
 ```
+Errors: `404` not found · `409` not pending OR transaction_code already used · `422` bad transaction_code format.
 
 ### Reject withdrawal
 Same full user block, with the rejection reason recorded and the locked balance unlocked.
@@ -882,6 +966,42 @@ curl -H "Authorization: Bearer $ADMIN_TOKEN" \
   "https://yourdomain.com/api.php?route=admin_payment_report"
 ```
 
+### Manual deposit claims (admin)
+```bash
+# List (status: pending|approved|rejected|all — default pending). Each item has a full user vetting block.
+curl -H "Authorization: Bearer $ADMIN_TOKEN" \
+  "https://yourdomain.com/api.php?route=admin_manual_claims&status=pending"
+
+# Approve → credits the user, writes a completed 'manual' deposit (code becomes globally unique), SMS sent
+curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{ "claim_id": 7, "note": "Confirmed on M-Pesa statement" }' \
+  "https://yourdomain.com/api.php?route=admin_approve_manual_claim"
+
+# Reject
+curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{ "claim_id": 7, "reason": "No matching M-Pesa transaction found" }' \
+  "https://yourdomain.com/api.php?route=admin_reject_manual_claim"
+```
+
+### Pause / resume deposits
+Independent of full maintenance mode — use it when PayHero or your server has trouble.
+```bash
+# Read current state
+curl -H "Authorization: Bearer $ADMIN_TOKEN" \
+  "https://yourdomain.com/api.php?route=admin_deposit_pause"
+
+# Pause
+curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{ "paused": true, "message": "Deposits are briefly offline for maintenance." }' \
+  "https://yourdomain.com/api.php?route=admin_deposit_pause"
+
+# Resume
+curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{ "paused": false }' \
+  "https://yourdomain.com/api.php?route=admin_deposit_pause"
+```
+When paused, `deposit_request` returns `503` with your message; everything else keeps working.
+
 ---
 
 ## 12. Social — Reactions
@@ -898,27 +1018,41 @@ curl "https://yourdomain.com/api.php?route=reactions&market_id=a1b2c3d4e5f67890"
 
 ---
 
-## 13. Social — Messages
+## 13. Social — Market Chat
+
+Chat is scoped to a single market. **There are no user-to-user direct messages.** When a market is settled or voided, every chat row for that market is deleted automatically.
 
 ```bash
-# Send
+# Read a market's chat (public, newest first)
+curl "https://yourdomain.com/api.php?route=market_chat&market_id=a1b2c3d4e5f67890&page=1&limit=50"
+
+# Post a message (auth; not suspended; not messaging-restricted; market must be non-terminal)
 curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  -d '{ "to_user_id": 5, "body": "Hey, what about the Newcastle market?", "sticker_id": 12 }' \
-  "https://yourdomain.com/api.php?route=send_message"
+  -d '{ "market_id": "a1b2c3d4e5f67890", "body": "Newcastle look strong today", "sticker_id": 12 }' \
+  "https://yourdomain.com/api.php?route=post_market_chat"
 
-# Inbox
-curl -H "Authorization: Bearer $TOKEN" \
-  "https://yourdomain.com/api.php?route=inbox&page=1&limit=20"
-
-# Conversation (marks received as read)
-curl -H "Authorization: Bearer $TOKEN" \
-  "https://yourdomain.com/api.php?route=conversation&user_id=5&page=1&limit=50"
-
-# Soft-delete own message (hard-deletes only when both parties have deleted)
+# Delete a message — users delete their OWN; admins can delete ANY (optional reason)
 curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  -d '{ "message_id": 45 }' \
-  "https://yourdomain.com/api.php?route=delete_message"
+  -d '{ "chat_id": 88 }' \
+  "https://yourdomain.com/api.php?route=delete_market_chat"
+
+curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{ "chat_id": 88, "reason": "Spam" }' \
+  "https://yourdomain.com/api.php?route=delete_market_chat"
 ```
+Read response:
+```json
+{
+  "success": true,
+  "data": [
+    { "chat_id": 88, "user_id": 5, "username": "charles", "body": "Newcastle look strong today",
+      "sticker": { "sticker_id": 12, "name": "fire", "category": "Sports", "filename": "...", "url": "https://cdn.../...webp" },
+      "posted_at": "2026-05-23 18:30:00" }
+  ],
+  "meta": { "total": 1, "page": 1, "limit": 50, "pages": 1 }
+}
+```
+Errors on post: `403` suspended / messaging-restricted · `404` market or sticker missing · `409` chat closed (market resolved/voided) · `422` body length.
 
 ---
 
@@ -1158,6 +1292,7 @@ DB_USER                   root
 DB_PASS                   <strong-password>           ← required, no default
 FRONTEND_URL              https://app.mwasinmarket.com (CORS)
 APP_PUBLIC_URL            https://app.mwasinmarket.com (used in email links)
+APP_SECRET                <random 64+ char string>    ← required in prod: signs the deposit captcha
 
 # OPTIONAL / FEATURE
 DEBUG_MODE                false
@@ -1170,15 +1305,16 @@ SMS_API_KEY               <…>
 SMS_USERNAME              <…>
 SMS_SENDER_ID             MwasinMkt
 
-# M-Pesa
-MPESA_CONSUMER_KEY        <…>
-MPESA_CONSUMER_SECRET     <…>
-MPESA_SHORTCODE           174379
-MPESA_PASSKEY             <…>
-MPESA_CALLBACK_URL        https://api.mwasinmarket.com/api.php?route=mpesa_webhook
-MPESA_B2C_URL             https://api.safaricom.co.ke/mpesa/b2c/v1/paymentrequest
-MPESA_IP_WHITELIST        196.201.214.200,196.201.214.206,196.201.213.114
-MPESA_WEBHOOK_SECRET      <optional shared secret in X-Mpesa-Secret>
+# PayHero (M-Pesa STK deposits)
+PAYHERO_AUTH_TOKEN        <base64 part only, WITHOUT the word "Basic">
+PAYHERO_CHANNEL_ID        8558
+PAYHERO_PROVIDER          m-pesa
+PAYHERO_CALLBACK_URL      https://api.mwasinmarket.com/payment_callback.php
+PAYHERO_CALLBACK_SECRET   <optional shared secret; sent as ?s= or X-Callback-Secret>
+# PAYHERO_BASE_URL        https://backend.payhero.co.ke/api/v2/payments   (default)
+
+# Anti-abuse (STK spam protection)
+# STK_MAX_PER_WINDOW=3, STK_WINDOW_SECONDS=600, CAPTCHA_TTL=300 are compile-time defaults in config.php
 
 # SMTP (Outlook example — works with the credentials you provided)
 SMTP_HOST                 smtp-mail.outlook.com
@@ -1231,7 +1367,7 @@ memory_limit = 128M
 
 ## 26. Database schema overview
 
-Twenty InnoDB tables. All `utf8mb4_unicode_ci`. Run `schema.sql` once on a fresh MySQL 8.0+ database.
+Twenty-one InnoDB tables. All `utf8mb4_unicode_ci`. Run `schema.sql` once on a fresh MySQL 8.0+ database.
 
 | #  | Table                          | Purpose                                                |
 |----|--------------------------------|--------------------------------------------------------|
@@ -1244,16 +1380,17 @@ Twenty InnoDB tables. All `utf8mb4_unicode_ci`. Run `schema.sql` once on a fresh
 | 7  | `market_snapshots`             | Odds time-series for charts                            |
 | 8  | `audit_logs`                   | Append-only admin/system action log                    |
 | 9  | `login_attempts`               | Rate-limit storage (IP-based)                          |
-| 10 | `deposits`                     | M-Pesa deposit requests (UNIQUE `external_reference`)  |
-| 11 | `withdrawals`                  | Withdrawal lifecycle (pending → completed / rejected)  |
+| 10 | `deposits`                     | PayHero deposits (UNIQUE `external_reference` + `client_reference`) |
+| 11 | `withdrawals`                  | Withdrawal lifecycle (manual disbursement w/ M-Pesa code) |
 | 12 | `reactions`                    | Heart toggles per user × market                        |
 | 13 | `stickers`                     | Sticker library (soft-delete only)                     |
-| 14 | `messages`                     | Direct messages (soft-delete on each side)             |
+| 14 | `market_chats`                 | Per-market chat (no DMs; auto-purged on resolve/void)  |
 | 15 | `sms_log`                      | Sent SMS audit (Africa's Talking)                      |
 | 16 | `user_bans`                    | Ban history (supports multiple ban/unban cycles)       |
-| 17 | `system_settings`              | Key-value (maintenance mode, etc.)                     |
+| 17 | `system_settings`              | Key-value (maintenance_mode, deposits_paused)          |
 | 18 | `notifications`                | Admin alert queue                                      |
 | 19 | `email_verification_tokens`    | 24 h tokens for email verification                     |
 | 20 | `password_reset_tokens`        | 1 h tokens for password reset                          |
+| 21 | `manual_deposit_claims`        | User-submitted M-Pesa codes for admin verification     |
 
 All FK with sensible `ON DELETE` (CASCADE for child-of-account, SET NULL for nullable references). CHECK constraints prevent negative balances. Every column that's filtered or sorted in code has an explicit index.

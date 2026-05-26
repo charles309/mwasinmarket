@@ -2,64 +2,10 @@
 declare(strict_types=1);
 
 /**
- * MwasinMarket API — Bootstrap
- * Config, DB, auth, rate limiting, validators, response helpers, audit.
- * Also handles auth + profile + my_bets + health routes.
+ * MwasinMarket — Bootstrap (shared infrastructure)
+ * Loaded by api.php and payment_callback.php. Assumes config.php is already required.
  */
 
-// ============================================================
-// SECTION 1.1 — CONFIGURATION CONSTANTS
-// ============================================================
-
-define('DB_HOST',            $_ENV['DB_HOST']            ?? 'localhost');
-define('DB_NAME',            $_ENV['DB_NAME']            ?? 'mwasinmarket');
-define('DB_USER',            $_ENV['DB_USER']            ?? 'root');
-define('DB_PASS',            $_ENV['DB_PASS']            ?? '');
-define('FRONTEND_URL',       $_ENV['FRONTEND_URL']       ?? '');
-define('DEBUG_MODE',         filter_var($_ENV['DEBUG_MODE'] ?? false, FILTER_VALIDATE_BOOLEAN));
-
-define('TOKEN_TTL',          86400);
-define('TOKEN_BYTES',        32);
-define('MAX_BODY_BYTES',     65536);
-
-define('STICKER_UPLOAD_PATH', $_ENV['STICKER_UPLOAD_PATH'] ?? '/var/www/stickers');
-define('STICKER_BASE_URL',    $_ENV['STICKER_BASE_URL']    ?? '');
-
-define('SMS_PROVIDER',       $_ENV['SMS_PROVIDER']       ?? 'africastalking');
-define('SMS_API_KEY',        $_ENV['SMS_API_KEY']        ?? '');
-define('SMS_USERNAME',       $_ENV['SMS_USERNAME']       ?? '');
-define('SMS_SENDER_ID',      $_ENV['SMS_SENDER_ID']      ?? 'MwasinMkt');
-
-define('MPESA_CONSUMER_KEY',    $_ENV['MPESA_CONSUMER_KEY']    ?? '');
-define('MPESA_CONSUMER_SECRET', $_ENV['MPESA_CONSUMER_SECRET'] ?? '');
-define('MPESA_SHORTCODE',       $_ENV['MPESA_SHORTCODE']       ?? '');
-define('MPESA_PASSKEY',         $_ENV['MPESA_PASSKEY']         ?? '');
-define('MPESA_CALLBACK_URL',    $_ENV['MPESA_CALLBACK_URL']    ?? '');
-define('MPESA_B2C_URL',         $_ENV['MPESA_B2C_URL']         ?? '');
-define('MPESA_IP_WHITELIST',    $_ENV['MPESA_IP_WHITELIST']    ?? '');
-define('MPESA_WEBHOOK_SECRET',  $_ENV['MPESA_WEBHOOK_SECRET']  ?? '');
-
-define('LMSR_B',             1000);
-define('LMSR_B_MIN',         50);
-define('LMSR_B_MAX',         10000);
-define('LMSR_MAX_ODDS',      10.0);
-define('FIXED_MIN_OVERROUND', 1.03);
-
-define('DUMMY_HASH', '$2y$12$abcdefghijklmnopqrstuuABCDEFGHIJKLMNOPQRSTUVWXYZ01234');
-
-define('LARGE_BET_THRESHOLD', 50000.0);
-define('WAGER_CAP_WARNING_RATIO', 0.95);
-
-if (!DEBUG_MODE) {
-    ini_set('display_errors', '0');
-    ini_set('display_startup_errors', '0');
-}
-error_reporting(E_ALL);
-
-date_default_timezone_set('Africa/Nairobi');
-
-// ============================================================
-// SECTION 1.2 — DB CONNECTION (SINGLETON PDO)
 // ============================================================
 
 function db(): PDO {
@@ -119,13 +65,15 @@ function fail(string $error, int $status = 400, array $details = []): never {
 }
 
 function internal_error(Throwable $e, string $context = ''): never {
+    $rid = $GLOBALS['REQUEST_ID'] ?? '-';
     $logEntry = json_encode([
-        'time'    => gmdate('Y-m-d H:i:s'),
-        'context' => $context,
-        'class'   => get_class($e),
-        'message' => $e->getMessage(),
-        'file'    => $e->getFile(),
-        'line'    => $e->getLine(),
+        'time'       => gmdate('Y-m-d H:i:s'),
+        'request_id' => $rid,
+        'context'    => $context,
+        'class'      => get_class($e),
+        'message'    => $e->getMessage(),
+        'file'       => $e->getFile(),
+        'line'       => $e->getLine(),
     ], JSON_UNESCAPED_UNICODE);
     error_log('[MwasinMarket][ERROR] ' . $logEntry);
     http_response_code(500);
@@ -468,292 +416,411 @@ function check_maintenance(): void {
 }
 
 // ============================================================
-// SECTION 1.9 — AUTH ROUTES (handled in bootstrap.php)
+// SMS (Africa's Talking)
 // ============================================================
 
-function dispatch_bootstrap_route(string $route, array $body): void {
-    switch ($route) {
-        case 'register':    handle_register($body);    return;
-        case 'login':       handle_login($body);       return;
-        case 'admin_login': handle_admin_login($body); return;
-        case 'logout':      handle_logout();           return;
-        case 'profile':     handle_profile();          return;
-        case 'my_bets':     handle_my_bets();          return;
-        case 'health':      handle_health();           return;
+
+if (!function_exists('send_sms_now')) {
+    function send_sms_now(string $phone, string $message, ?int $userId = null, ?int $sentBy = null): array {
+        $phone = trim($phone);
+        $message = mb_substr($message, 0, 160, 'UTF-8');
+
+        $logIns = db()->prepare("INSERT INTO sms_log (user_id, phone, message, status, provider, sent_by, created_at) VALUES (:uid, :ph, :msg, 'queued', :prov, :sb, NOW())");
+        $logIns->execute([':uid' => $userId, ':ph' => $phone, ':msg' => $message, ':prov' => SMS_PROVIDER, ':sb' => $sentBy]);
+        $logId = (int)db()->lastInsertId();
+
+        if (SMS_PROVIDER === 'africastalking' && SMS_API_KEY !== '' && SMS_USERNAME !== '') {
+            $url = 'https://api.africastalking.com/version1/messaging';
+            $postData = http_build_query([
+                'username' => SMS_USERNAME,
+                'to'       => $phone,
+                'message'  => $message,
+                'from'     => SMS_SENDER_ID,
+            ]);
+            $ctx = stream_context_create([
+                'http' => [
+                    'method'  => 'POST',
+                    'header'  => "Content-Type: application/x-www-form-urlencoded\r\nAccept: application/json\r\napiKey: " . SMS_API_KEY . "\r\n",
+                    'content' => $postData,
+                    'timeout' => 8,
+                    'ignore_errors' => true,
+                ],
+            ]);
+            $response = @file_get_contents($url, false, $ctx);
+            $providerId = null;
+            $status = 'sent';
+            $error = null;
+            if ($response === false) {
+                $status = 'failed'; $error = 'No response from provider';
+            } else {
+                $data = json_decode($response, true);
+                if (is_array($data) && isset($data['SMSMessageData']['Recipients'][0]['messageId'])) {
+                    $providerId = (string)$data['SMSMessageData']['Recipients'][0]['messageId'];
+                } else {
+                    $status = 'failed'; $error = mb_substr((string)$response, 0, 300, 'UTF-8');
+                }
+            }
+            $upd = db()->prepare("UPDATE sms_log SET status = :st, provider_id = :pid, error = :err WHERE id = :id");
+            $upd->execute([':st' => $status, ':pid' => $providerId, ':err' => $error, ':id' => $logId]);
+            return ['id' => $logId, 'status' => $status, 'provider_id' => $providerId, 'error' => $error];
+        }
+
+        // No provider configured: leave as queued, return as queued
+        return ['id' => $logId, 'status' => 'queued', 'provider_id' => null, 'error' => null];
     }
-    fail('Route not found', 404);
 }
 
-function handle_register(array $body): void {
-    check_rate_limit(20, 3600);
-    require_fields($body, ['username', 'email', 'phone', 'password']);
-    $username = validate_text($body['username'], 'username', 3, 30);
-    if (!preg_match('/^[a-zA-Z0-9_\-]+$/', $username)) {
-        fail('Username must contain only letters, digits, underscores or hyphens.', 422, ['username']);
+// ============================================================
+// NETWORK HELPERS
+// ============================================================
+
+function ip_in_whitelist(string $ip, string $list): bool {
+    if ($list === '') return true;
+    $allowed = array_map('trim', explode(',', $list));
+    foreach ($allowed as $entry) {
+        if ($entry === '') continue;
+        if (strpos($entry, '/') !== false) {
+            if (cidr_match($ip, $entry)) return true;
+        } else {
+            if ($ip === $entry) return true;
+        }
     }
-    $email = validate_text($body['email'], 'email', 5, 254);
-    if (!valid_email($email)) fail('Invalid email address.', 422, ['email']);
-    $phone = validate_phone_ke($body['phone']);
-    $password = is_string($body['password'] ?? null) ? $body['password'] : '';
-    if (mb_strlen($password, 'UTF-8') < 8) fail('Password must be at least 8 characters.', 422, ['password']);
-    if (mb_strlen($password, 'UTF-8') > 200) fail('Password too long.', 422, ['password']);
-    $fullName = isset($body['full_name']) ? validate_text($body['full_name'], 'full_name', 0, 120) : '';
-
-    $check = db()->prepare("SELECT id FROM users WHERE username = :u OR email = :e OR phone = :p LIMIT 1");
-    $check->execute([':u' => $username, ':e' => $email, ':p' => $phone]);
-    if ($check->fetch()) fail('A user with that username, email, or phone already exists.', 409);
-
-    $hash = password_hash($password, PASSWORD_BCRYPT, ['cost' => 12]);
-    $ins = db()->prepare("
-        INSERT INTO users (username, email, phone, full_name, password_hash, role, balance, locked_balance, bonus_balance, created_at, updated_at)
-        VALUES (:u, :e, :p, :fn, :h, 'user', 0, 0, 0, NOW(), NOW())
-    ");
-    $ins->execute([':u' => $username, ':e' => $email, ':p' => $phone, ':fn' => $fullName, ':h' => $hash]);
-    $userId = (int)db()->lastInsertId();
-    clear_rate_limit_attempt();
-    $token = issue_token($userId);
-    audit_log('user_registered', 0, 'user', $userId, ['username' => $username]);
-    ok([
-        'user_id'  => $userId,
-        'username' => $username,
-        'email'    => $email,
-        'phone'    => $phone,
-        'role'     => 'user',
-        'token'    => $token,
-        'expires_in' => TOKEN_TTL,
-    ], 'Registration successful', 201);
+    return false;
 }
 
-function handle_login(array $body): void {
-    check_rate_limit(10, 900);
-    require_fields($body, ['identifier', 'password']);
-    $identifier = is_string($body['identifier']) ? trim($body['identifier']) : '';
-    $password   = is_string($body['password']) ? $body['password'] : '';
-    if ($identifier === '' || $password === '') fail('Invalid credentials.', 401);
-
-    $stmt = db()->prepare("SELECT id, username, password_hash, role, is_suspended FROM users WHERE (username = :id OR email = :id OR phone = :id) LIMIT 1");
-    $stmt->execute([':id' => $identifier]);
-    $user = $stmt->fetch();
-
-    if (!$user) {
-        password_verify($password, DUMMY_HASH); // timing
-        fail('Invalid credentials.', 401);
-    }
-    if (!password_verify($password, (string)$user['password_hash'])) {
-        fail('Invalid credentials.', 401);
-    }
-    if ((int)$user['is_suspended'] === 1) {
-        fail('Your account has been suspended.', 403);
-    }
-    clear_rate_limit_attempt();
-    cleanup_expired_tokens((int)$user['id']);
-    $token = issue_token((int)$user['id']);
-    ok([
-        'user_id'  => (int)$user['id'],
-        'username' => $user['username'],
-        'role'     => $user['role'],
-        'token'    => $token,
-        'expires_in' => TOKEN_TTL,
-    ], 'Login successful');
+function cidr_match(string $ip, string $cidr): bool {
+    [$subnet, $bits] = explode('/', $cidr);
+    $bits = (int)$bits;
+    $ipL = ip2long($ip);
+    $subL = ip2long($subnet);
+    if ($ipL === false || $subL === false) return false;
+    $mask = -1 << (32 - $bits);
+    return ($ipL & $mask) === ($subL & $mask);
 }
 
-function handle_admin_login(array $body): void {
-    check_rate_limit(10, 900);
-    require_fields($body, ['identifier', 'password']);
-    $identifier = is_string($body['identifier']) ? trim($body['identifier']) : '';
-    $password   = is_string($body['password']) ? $body['password'] : '';
-    if ($identifier === '' || $password === '') fail('Invalid credentials.', 401);
+// ============================================================
+// ADMIN USER VETTING (shared by payments + admin)
+// ============================================================
 
-    $stmt = db()->prepare("SELECT id, username, password_hash, role, is_suspended FROM users WHERE (username = :id OR email = :id OR phone = :id) LIMIT 1");
-    $stmt->execute([':id' => $identifier]);
-    $user = $stmt->fetch();
+function _admin_user_vetting(int $userId): ?array {
+    $pdo = db();
+    $u = $pdo->prepare("SELECT id, username, email, phone, full_name, role, balance, locked_balance, bonus_balance, total_wagered, total_wins, verified, email_verified, phone_verified, is_suspended, messaging_restricted, created_at FROM users WHERE id = :id LIMIT 1");
+    $u->execute([':id' => $userId]);
+    $user = $u->fetch();
+    if (!$user) return null;
 
-    if (!$user) {
-        password_verify($password, DUMMY_HASH);
-        fail('Invalid credentials.', 401);
-    }
-    if (!password_verify($password, (string)$user['password_hash'])) {
-        fail('Invalid credentials.', 401);
-    }
-    if ($user['role'] !== 'admin') {
-        fail('Admin access required.', 403);
-    }
-    if ((int)$user['is_suspended'] === 1) {
-        fail('Your account has been suspended.', 403);
-    }
-    clear_rate_limit_attempt();
-    cleanup_expired_tokens((int)$user['id']);
-    $token = issue_token((int)$user['id']);
-    audit_log('admin_login', (int)$user['id'], 'user', (int)$user['id'], ['ip' => client_ip()]);
-    ok([
-        'user_id'  => (int)$user['id'],
-        'username' => $user['username'],
-        'role'     => 'admin',
-        'token'    => $token,
-        'expires_in' => TOKEN_TTL,
-    ], 'Admin login successful');
-}
+    $bets = $pdo->prepare("SELECT
+        COUNT(*) AS total,
+        SUM(CASE WHEN status='open' THEN 1 ELSE 0 END) AS open,
+        SUM(CASE WHEN status='won'  THEN 1 ELSE 0 END) AS won,
+        SUM(CASE WHEN status='lost' THEN 1 ELSE 0 END) AS lost,
+        SUM(CASE WHEN status='void' THEN 1 ELSE 0 END) AS void,
+        COALESCE(SUM(stake),0) AS total_stake,
+        COALESCE(SUM(CASE WHEN status='won' THEN payout ELSE 0 END),0) AS total_payout
+        FROM bets WHERE user_id = :id");
+    $bets->execute([':id' => $userId]);
+    $bs = $bets->fetch();
 
-function handle_logout(): void {
-    $auth = require_auth();
-    revoke_token($auth['token']);
-    ok(['logged_out' => true], 'Logged out');
-}
+    $dep = $pdo->prepare("SELECT
+        COUNT(*) AS total,
+        SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS completed,
+        COALESCE(SUM(CASE WHEN status='completed' THEN amount ELSE 0 END),0) AS total_completed,
+        MAX(CASE WHEN status='completed' THEN completed_at ELSE NULL END) AS last_at
+        FROM deposits WHERE user_id = :id");
+    $dep->execute([':id' => $userId]);
+    $depRow = $dep->fetch();
 
-function handle_profile(): void {
-    $auth = require_auth();
-    $stmt = db()->prepare("
-        SELECT id, username, email, phone, full_name, role, balance, locked_balance, bonus_balance,
-               total_wagered, total_wins, verified, email_verified, phone_verified,
-               is_suspended, messaging_restricted, created_at
-        FROM users WHERE id = :uid LIMIT 1
-    ");
-    $stmt->execute([':uid' => $auth['user_id']]);
-    $user = $stmt->fetch();
-    if (!$user) fail('User not found.', 404);
+    $wd = $pdo->prepare("SELECT
+        COUNT(*) AS total,
+        SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS completed,
+        SUM(CASE WHEN status='pending'   THEN 1 ELSE 0 END) AS pending,
+        SUM(CASE WHEN status='rejected'  THEN 1 ELSE 0 END) AS rejected,
+        COALESCE(SUM(CASE WHEN status='completed' THEN amount ELSE 0 END),0) AS total_completed,
+        MAX(CASE WHEN status='completed' THEN completed_at ELSE NULL END) AS last_at
+        FROM withdrawals WHERE user_id = :id");
+    $wd->execute([':id' => $userId]);
+    $wdRow = $wd->fetch();
 
-    $stats = db()->prepare("
-        SELECT
-            COUNT(*) AS total_bets,
-            SUM(CASE WHEN status='open' THEN 1 ELSE 0 END) AS open_bets,
-            SUM(CASE WHEN status='won' THEN 1 ELSE 0 END)  AS won_bets,
-            SUM(CASE WHEN status='lost' THEN 1 ELSE 0 END) AS lost_bets,
-            SUM(CASE WHEN status='void' THEN 1 ELSE 0 END) AS void_bets,
-            COALESCE(SUM(stake),0) AS total_stake,
-            COALESCE(SUM(CASE WHEN status='won' THEN payout ELSE 0 END),0) AS total_payout
-        FROM bets WHERE user_id = :uid
-    ");
-    $stats->execute([':uid' => $auth['user_id']]);
-    $bs = $stats->fetch();
+    $bans = $pdo->prepare("SELECT id, reason, banned_at, lifted_at FROM user_bans WHERE user_id = :id ORDER BY banned_at DESC LIMIT 5");
+    $bans->execute([':id' => $userId]);
+    $banHistory = $bans->fetchAll();
 
-    ok([
-        'user' => [
-            'id'                   => (int)$user['id'],
-            'username'             => $user['username'],
-            'email'                => $user['email'],
-            'phone'                => $user['phone'],
-            'full_name'            => $user['full_name'],
-            'role'                 => $user['role'],
-            'balance'              => (float)$user['balance'],
-            'locked_balance'       => (float)$user['locked_balance'],
-            'available_balance'    => (float)$user['balance'] - (float)$user['locked_balance'],
-            'bonus_balance'        => (float)$user['bonus_balance'],
-            'total_wagered'        => (float)$user['total_wagered'],
-            'total_wins'           => (float)$user['total_wins'],
-            'verified'             => (bool)$user['verified'],
-            'email_verified'       => (bool)$user['email_verified'],
-            'phone_verified'       => (bool)$user['phone_verified'],
-            'is_suspended'         => (bool)$user['is_suspended'],
-            'messaging_restricted' => (bool)$user['messaging_restricted'],
-            'created_at'           => $user['created_at'],
-        ],
+    $lastBets = $pdo->prepare("SELECT slip_id, market_id, stake, status, created_at FROM bets WHERE user_id = :id ORDER BY created_at DESC LIMIT 5");
+    $lastBets->execute([':id' => $userId]);
+    $recentBets = $lastBets->fetchAll();
+
+    $pendingW = $pdo->prepare("SELECT id, amount, phone, status, created_at FROM withdrawals WHERE user_id = :id AND status IN ('pending','processing','approved') ORDER BY created_at DESC");
+    $pendingW->execute([':id' => $userId]);
+    $pendingWithdrawals = $pendingW->fetchAll();
+
+    return [
+        'user_id'              => (int)$user['id'],
+        'username'             => $user['username'],
+        'email'                => $user['email'],
+        'phone'                => $user['phone'],
+        'full_name'            => $user['full_name'],
+        'role'                 => $user['role'],
+        'verified'             => (bool)$user['verified'],
+        'email_verified'       => (bool)$user['email_verified'],
+        'phone_verified'       => (bool)$user['phone_verified'],
+        'is_suspended'         => (bool)$user['is_suspended'],
+        'messaging_restricted' => (bool)$user['messaging_restricted'],
+        'balance'              => (float)$user['balance'],
+        'locked_balance'       => (float)$user['locked_balance'],
+        'available_balance'    => (float)$user['balance'] - (float)$user['locked_balance'],
+        'bonus_balance'        => (float)$user['bonus_balance'],
+        'total_wagered'        => (float)$user['total_wagered'],
+        'total_wins'           => (float)$user['total_wins'],
+        'member_since'         => $user['created_at'],
         'bet_stats' => [
-            'total_bets'    => (int)$bs['total_bets'],
-            'open_bets'     => (int)$bs['open_bets'],
-            'won_bets'      => (int)$bs['won_bets'],
-            'lost_bets'     => (int)$bs['lost_bets'],
-            'void_bets'     => (int)$bs['void_bets'],
+            'total'         => (int)$bs['total'],
+            'open'          => (int)$bs['open'],
+            'won'           => (int)$bs['won'],
+            'lost'          => (int)$bs['lost'],
+            'void'          => (int)$bs['void'],
             'total_stake'   => (float)$bs['total_stake'],
             'total_payout'  => (float)$bs['total_payout'],
         ],
-    ]);
-}
-
-function handle_my_bets(): void {
-    $auth = require_auth();
-    $page  = max(1, (int)($_GET['page'] ?? 1));
-    $limit = min(100, max(1, (int)($_GET['limit'] ?? 20)));
-    $offset = ($page - 1) * $limit;
-    $status = isset($_GET['status']) ? (string)$_GET['status'] : '';
-    $history = !empty($_GET['history']);
-
-    $where = ['b.user_id = :uid'];
-    $params = [':uid' => $auth['user_id']];
-    if ($status !== '') {
-        if (!in_array($status, ['open', 'won', 'lost', 'void'], true)) {
-            fail('Invalid status filter.', 422, ['status']);
-        }
-        $where[] = 'b.status = :st';
-        $params[':st'] = $status;
-    } elseif (!$history) {
-        $where[] = "b.status = 'open'";
-    }
-    $whereSql = implode(' AND ', $where);
-
-    $countStmt = db()->prepare("SELECT COUNT(*) c FROM bets b WHERE {$whereSql}");
-    $countStmt->execute($params);
-    $total = (int)$countStmt->fetch()['c'];
-
-    $sql = "
-        SELECT b.id, b.slip_id, b.market_id, b.outcome_id, b.is_bonus_bet, b.shares, b.stake,
-               b.odds_at_entry, b.possible_win, b.payout, b.status, b.void_reason, b.expires_at, b.created_at,
-               m.market_id AS market_pubid, m.question, m.status AS market_status,
-               o.name AS outcome_name
-        FROM bets b
-        JOIN markets m ON m.id = b.market_id
-        JOIN outcomes o ON o.id = b.outcome_id
-        WHERE {$whereSql}
-        ORDER BY b.created_at DESC
-        LIMIT :lim OFFSET :off
-    ";
-    $stmt = db()->prepare($sql);
-    foreach ($params as $k => $v) $stmt->bindValue($k, $v);
-    $stmt->bindValue(':lim', $limit, PDO::PARAM_INT);
-    $stmt->bindValue(':off', $offset, PDO::PARAM_INT);
-    $stmt->execute();
-    $rows = $stmt->fetchAll();
-
-    $out = [];
-    foreach ($rows as $r) {
-        $out[] = [
-            'slip_id'       => $r['slip_id'],
-            'market_id'     => $r['market_pubid'],
-            'question'      => $r['question'],
-            'market_status' => $r['market_status'],
-            'outcome_id'    => (int)$r['outcome_id'],
-            'outcome_name'  => $r['outcome_name'],
-            'is_bonus_bet'  => (bool)$r['is_bonus_bet'],
-            'shares'        => (float)$r['shares'],
-            'stake'         => (float)$r['stake'],
-            'odds_at_entry' => (float)$r['odds_at_entry'],
-            'possible_win'  => (float)$r['possible_win'],
-            'payout'        => $r['payout'] === null ? null : (float)$r['payout'],
-            'status'        => $r['status'],
-            'void_reason'   => $r['void_reason'],
-            'expires_at'    => $r['expires_at'],
-            'created_at'    => $r['created_at'],
-        ];
-    }
-
-    ok([
-        'data' => $out,
-        'meta' => [
-            'total' => $total,
-            'page'  => $page,
-            'limit' => $limit,
-            'pages' => (int)ceil($total / $limit),
+        'deposit_stats' => [
+            'total'           => (int)$depRow['total'],
+            'completed'       => (int)$depRow['completed'],
+            'total_completed' => (float)$depRow['total_completed'],
+            'last_deposit'    => $depRow['last_at'],
         ],
-    ]);
+        'withdrawal_stats' => [
+            'total'           => (int)$wdRow['total'],
+            'completed'       => (int)$wdRow['completed'],
+            'pending'         => (int)$wdRow['pending'],
+            'rejected'        => (int)$wdRow['rejected'],
+            'total_completed' => (float)$wdRow['total_completed'],
+            'last_withdrawal' => $wdRow['last_at'],
+        ],
+        'net_position'        => round((float)$depRow['total_completed'] - (float)$wdRow['total_completed'], 2),
+        'ban_history'         => $banHistory,
+        'recent_bets'         => $recentBets,
+        'pending_withdrawals' => $pendingWithdrawals,
+    ];
 }
 
-function handle_health(): void {
-    if (!DEBUG_MODE) {
-        $tok = read_bearer();
-        $res = $tok === '' ? null : resolve_token($tok);
-        if (!$res || $res['role'] !== 'admin') fail('Forbidden.', 403);
+// ============================================================
+// SMTP / EMAIL
+// ============================================================
+
+function smtp_send_mail(string $to, string $subject, string $htmlBody): array {
+    if (SMTP_HOST === '' || SMTP_USERNAME === '' || SMTP_PASSWORD === '' || SMTP_FROM === '') {
+        return ['ok' => false, 'error' => 'SMTP not configured'];
     }
-    $ok = true;
-    $dbError = null;
+    if (!valid_email($to)) {
+        return ['ok' => false, 'error' => 'Invalid recipient address'];
+    }
+    $fp = @stream_socket_client(
+        'tcp://' . SMTP_HOST . ':' . SMTP_PORT,
+        $errno, $errstr, 15, STREAM_CLIENT_CONNECT
+    );
+    if (!$fp) return ['ok' => false, 'error' => "Connect failed: {$errstr}"];
+    stream_set_timeout($fp, 15);
+
+    $read = function() use ($fp): string {
+        $data = '';
+        while (!feof($fp)) {
+            $line = fgets($fp, 1024);
+            if ($line === false) break;
+            $data .= $line;
+            if (strlen($line) >= 4 && $line[3] === ' ') break;
+        }
+        return $data;
+    };
+    $write = function(string $cmd) use ($fp): void {
+        fwrite($fp, $cmd . "\r\n");
+    };
+    $expect = function(string $code) use ($read): string {
+        $r = $read();
+        if (substr($r, 0, 3) !== $code) {
+            throw new RuntimeException("SMTP expected {$code}: " . trim($r));
+        }
+        return $r;
+    };
+
     try {
-        db()->query('SELECT 1')->fetch();
+        $expect('220');
+        $write('EHLO ' . gethostname()); $expect('250');
+        $write('STARTTLS'); $expect('220');
+        $cryptoMethod = STREAM_CRYPTO_METHOD_TLS_CLIENT;
+        if (defined('STREAM_CRYPTO_METHOD_TLSv1_2_CLIENT')) {
+            $cryptoMethod = STREAM_CRYPTO_METHOD_TLSv1_2_CLIENT;
+        }
+        if (!@stream_socket_enable_crypto($fp, true, $cryptoMethod)) {
+            throw new RuntimeException('TLS handshake failed');
+        }
+        $write('EHLO ' . gethostname()); $expect('250');
+        $write('AUTH LOGIN'); $expect('334');
+        $write(base64_encode(SMTP_USERNAME)); $expect('334');
+        $write(base64_encode(SMTP_PASSWORD)); $expect('235');
+        $write('MAIL FROM:<' . SMTP_FROM . '>'); $expect('250');
+        $write('RCPT TO:<' . $to . '>'); $expect('250');
+        $write('DATA'); $expect('354');
+
+        $fromName = addslashes(SMTP_FROM_NAME);
+        $headers  = "From: \"{$fromName}\" <" . SMTP_FROM . ">\r\n";
+        $headers .= "To: <{$to}>\r\n";
+        $headers .= "Subject: " . mb_encode_mimeheader($subject, 'UTF-8') . "\r\n";
+        $headers .= "MIME-Version: 1.0\r\n";
+        $headers .= "Content-Type: text/html; charset=utf-8\r\n";
+        $headers .= "Date: " . date('r') . "\r\n";
+        $headers .= "Message-ID: <" . bin2hex(random_bytes(8)) . "@" . SMTP_HOST . ">\r\n";
+
+        // RFC5321: lines beginning with "." must be dot-stuffed
+        $bodyOut = preg_replace('/(^|\r\n)\./', '$1..', $htmlBody);
+        fwrite($fp, $headers . "\r\n" . $bodyOut . "\r\n.\r\n");
+        $expect('250');
+        $write('QUIT');
+        @fclose($fp);
+        return ['ok' => true];
     } catch (Throwable $e) {
-        $ok = false;
-        $dbError = DEBUG_MODE ? $e->getMessage() : 'db error';
+        @fclose($fp);
+        error_log('[MwasinMarket][SMTP] ' . $e->getMessage());
+        return ['ok' => false, 'error' => $e->getMessage()];
     }
-    ok([
-        'status' => $ok ? 'healthy' : 'unhealthy',
-        'db'     => $ok ? 'up' : 'down',
-        'db_error' => $dbError,
-        'time'   => gmdate('Y-m-d H:i:s'),
-    ]);
+}
+
+function send_verification_email(int $userId, string $email, string $username): array {
+    $token = bin2hex(random_bytes(32));
+    $expires = gmdate('Y-m-d H:i:s', time() + EMAIL_TOKEN_TTL);
+    $ins = db()->prepare("INSERT INTO email_verification_tokens (user_id, token, expires_at, created_at) VALUES (:uid, :tok, :exp, NOW())");
+    $ins->execute([':uid' => $userId, ':tok' => $token, ':exp' => $expires]);
+
+    $link = APP_PUBLIC_URL !== ''
+        ? rtrim(APP_PUBLIC_URL, '/') . '/verify-email?token=' . $token
+        : 'POST ?route=verify_email with body { "token": "' . $token . '" }';
+    $u = htmlspecialchars($username, ENT_QUOTES, 'UTF-8');
+    $l = htmlspecialchars($link, ENT_QUOTES, 'UTF-8');
+    $body = "<!DOCTYPE html><html><body style='font-family:Arial,sans-serif;background:#f6f8fb;padding:30px'>
+        <div style='max-width:560px;margin:auto;background:#fff;border-radius:8px;padding:30px'>
+        <h2 style='color:#2b6cb0'>Verify your email — MwasinMarket</h2>
+        <p>Hi {$u},</p>
+        <p>Please verify your email to activate your account:</p>
+        <p style='text-align:center;margin:25px 0'>
+          <a href='{$l}' style='background:#2b6cb0;color:#fff;padding:12px 24px;text-decoration:none;border-radius:5px'>Verify Email</a>
+        </p>
+        <p style='font-size:12px;color:#666'>Or paste this token into the app: <code>{$token}</code></p>
+        <p style='font-size:12px;color:#666'>This link expires in 24 hours. If you did not register, ignore this email.</p>
+        </div></body></html>";
+
+    return smtp_send_mail($email, 'Verify your MwasinMarket email', $body);
+}
+
+function send_password_reset_email(int $userId, string $email, string $username, string $ip): array {
+    $token = bin2hex(random_bytes(32));
+    $expires = gmdate('Y-m-d H:i:s', time() + PASSWORD_RESET_TTL);
+    $ins = db()->prepare("INSERT INTO password_reset_tokens (user_id, token, expires_at, requested_ip, created_at) VALUES (:uid, :tok, :exp, :ip, NOW())");
+    $ins->execute([':uid' => $userId, ':tok' => $token, ':exp' => $expires, ':ip' => $ip]);
+
+    $link = APP_PUBLIC_URL !== ''
+        ? rtrim(APP_PUBLIC_URL, '/') . '/reset-password?token=' . $token
+        : 'POST ?route=reset_password with body { "token": "' . $token . '", "new_password": "..." }';
+    $u = htmlspecialchars($username, ENT_QUOTES, 'UTF-8');
+    $l = htmlspecialchars($link, ENT_QUOTES, 'UTF-8');
+    $body = "<!DOCTYPE html><html><body style='font-family:Arial,sans-serif;background:#f6f8fb;padding:30px'>
+        <div style='max-width:560px;margin:auto;background:#fff;border-radius:8px;padding:30px'>
+        <h2 style='color:#c53030'>Password reset — MwasinMarket</h2>
+        <p>Hi {$u},</p>
+        <p>We received a password reset request for your account.</p>
+        <p style='text-align:center;margin:25px 0'>
+          <a href='{$l}' style='background:#c53030;color:#fff;padding:12px 24px;text-decoration:none;border-radius:5px'>Reset Password</a>
+        </p>
+        <p style='font-size:12px;color:#666'>Or paste this token: <code>{$token}</code></p>
+        <p style='font-size:12px;color:#666'>This link expires in 1 hour. If you did not request this, ignore this email — your password will not change.</p>
+        </div></body></html>";
+
+    return smtp_send_mail($email, 'Reset your MwasinMarket password', $body);
+}
+
+// ============================================================
+// MATH CAPTCHA (stateless, HMAC-signed) — anti STK-spam
+// ============================================================
+
+function _captcha_secret(): string {
+    if (APP_SECRET !== '') return APP_SECRET;
+    // Fallback derives a key so the feature still works if APP_SECRET is unset,
+    // but log a warning — production MUST set APP_SECRET.
+    error_log('[MwasinMarket] WARNING: APP_SECRET not set; captcha using derived key.');
+    return hash('sha256', DB_PASS . '|' . DB_NAME . '|mwasin-captcha');
+}
+
+/** Issue a fresh math challenge. Returns [question, token]. Stateless. */
+function captcha_issue(): array {
+    $a = random_int(1, 9);
+    $b = random_int(1, 9);
+    $ops = ['+', '-', '*'];
+    $op = $ops[random_int(0, 2)];
+    switch ($op) {
+        case '+': $answer = $a + $b; $q = "$a + $b"; break;
+        case '-': if ($b > $a) { $t = $a; $a = $b; $b = $t; } $answer = $a - $b; $q = "$a - $b"; break;
+        default:  $answer = $a * $b; $q = "$a × $b"; break;
+    }
+    $exp = time() + CAPTCHA_TTL;
+    $nonce = bin2hex(random_bytes(8));
+    // Bind the answer to an expiry + nonce, signed so the client can't forge it.
+    $payload = $answer . '.' . $exp . '.' . $nonce;
+    $sig = hash_hmac('sha256', $payload, _captcha_secret());
+    $token = $exp . '.' . $nonce . '.' . $sig;
+    return ['question' => $q . ' = ?', 'token' => $token, 'expires_in' => CAPTCHA_TTL];
+}
+
+/** Verify a solved challenge. Returns true if correct + unexpired + signature valid. */
+function captcha_verify(mixed $token, mixed $answer): bool {
+    if (!is_string($token)) return false;
+    $parts = explode('.', $token);
+    if (count($parts) !== 3) return false;
+    [$exp, $nonce, $sig] = $parts;
+    if (!ctype_digit($exp) || !ctype_xdigit($nonce) || !ctype_xdigit($sig)) return false;
+    if ((int)$exp < time()) return false;
+    // Recompute expected signature for each plausible integer answer would leak nothing;
+    // instead recompute using the supplied answer and constant-time compare.
+    if (is_string($answer)) { $answer = trim($answer); if ($answer === '' || !preg_match('/^-?\d+$/', $answer)) return false; $answer = (int)$answer; }
+    if (!is_int($answer)) return false;
+    $payload = $answer . '.' . $exp . '.' . $nonce;
+    $expected = hash_hmac('sha256', $payload, _captcha_secret());
+    return hash_equals($expected, $sig);
+}
+
+// ============================================================
+// PHONE NORMALISATION
+// ============================================================
+
+/** Convert +254XXXXXXXXX / 254XXXXXXXXX / 07XXXXXXXX → 07XXXXXXXX (PayHero local format). */
+function phone_to_local(string $phone): string {
+    $d = preg_replace('/[^0-9]/', '', $phone);
+    if (str_starts_with($d, '254')) $d = '0' . substr($d, 3);
+    if (str_starts_with($d, '7') && strlen($d) === 9) $d = '0' . $d;
+    return $d;
+}
+
+// ============================================================
+// DEPOSIT PAUSE (independent of full maintenance mode)
+// ============================================================
+
+function deposits_paused(): array {
+    try {
+        $row = db()->query("SELECT value, message FROM system_settings WHERE `key`='deposits_paused' LIMIT 1")->fetch();
+    } catch (Throwable $e) {
+        return ['paused' => false, 'message' => null];
+    }
+    $paused = $row && (string)$row['value'] === '1';
+    return ['paused' => $paused, 'message' => $row['message'] ?? null];
+}
+
+// ============================================================
+// MARKET CHAT PURGE (called when a market reaches a terminal state)
+// ============================================================
+
+function purge_market_chats(int $marketId): int {
+    try {
+        $stmt = db()->prepare("DELETE FROM market_chats WHERE market_id = :mid");
+        $stmt->execute([':mid' => $marketId]);
+        return $stmt->rowCount();
+    } catch (Throwable $e) {
+        error_log('[MwasinMarket] purge_market_chats failed: ' . $e->getMessage());
+        return 0;
+    }
 }

@@ -1,17 +1,7 @@
 <?php
 declare(strict_types=1);
 
-/**
- * MwasinMarket API — Markets & Betting
- * Assumes bootstrap.php is already loaded.
- *
- * NOTE: No sell/cash-out route exists. Users buy-only. This prevents
- * round-trip LMSR arbitrage entirely.
- */
-
-// ============================================================
-// LMSR ENGINE
-// ============================================================
+/** MwasinMarket — Markets, betting, LMSR engine, admin market routes. Requires config.php + bootstrap.php. */
 
 function lmsr_cost(array $shares, float $b): float {
     if (empty($shares) || $b <= 0) return 0.0;
@@ -206,11 +196,12 @@ function fetch_market_outcomes(int $marketId): array {
 
 function public_market_row(array $m, array $outcomes): array {
     return [
+        'id'                => 'pm_' . $m['market_id'],
         'market_id'         => $m['market_id'],
+        'source'            => $m['source'] ?: 'local',
         'question'          => $m['question'],
         'title'             => $m['title'],
         'image_url'         => $m['image_url'],
-        'source'            => $m['source'],
         'category'          => $m['category'],
         'market_type'       => $m['market_type'],
         'status'            => $m['status'],
@@ -231,35 +222,6 @@ function public_market_row(array $m, array $outcomes): array {
 // ============================================================
 // ROUTE DISPATCH
 // ============================================================
-
-function dispatch_markets_route(string $route, array $body): void {
-    switch ($route) {
-        case 'markets':                    handle_markets_list();           return;
-        case 'market':                     handle_market_single();          return;
-        case 'market_history':             handle_market_history();         return;
-        case 'bet':                        handle_bet($body);               return;
-        case 'admin_create_market':        handle_admin_create_market($body); return;
-        case 'admin_pause_market':         handle_admin_pause_market($body); return;
-        case 'admin_resume_market':        handle_admin_resume_market($body); return;
-        case 'admin_force_close_market':   handle_admin_force_close_market($body); return;
-        case 'admin_reopen_market':        handle_admin_reopen_market($body); return;
-        case 'admin_settle_market':        handle_admin_settle_market($body); return;
-        case 'admin_void_market':          handle_admin_void_market($body); return;
-        case 'admin_void_bets_by_time':    handle_admin_void_bets_by_time($body); return;
-        case 'admin_void_bet':             handle_admin_void_bet($body); return;
-        case 'admin_archive_market':       handle_admin_archive_market($body); return;
-        case 'admin_edit_market':          handle_admin_edit_market($body); return;
-        case 'admin_adjust_limits':        handle_admin_adjust_limits($body); return;
-        case 'admin_extend_close_time':    handle_admin_extend_close_time($body); return;
-        case 'admin_set_liquidity':        handle_admin_set_liquidity($body); return;
-        case 'admin_reseed_odds':          handle_admin_reseed_odds($body); return;
-        case 'admin_set_odds_mode':        handle_admin_set_odds_mode($body); return;
-        case 'admin_stats':                handle_admin_stats(); return;
-        case 'admin_market_report':        handle_admin_market_report(); return;
-    }
-    fail('Route not found', 404);
-}
-
 // ============================================================
 // PUBLIC ROUTES
 // ============================================================
@@ -362,7 +324,7 @@ function handle_market_single(): void {
 
 function handle_market_history(): void {
     $mid = validate_market_id($_GET['market_id'] ?? '');
-    $limit = min(500, max(10, (int)($_GET['limit'] ?? 100)));
+    $limit = min(500, max(10, (int)($_GET['limit'] ?? 200)));
     $outcomeFilter = isset($_GET['outcome_id']) ? strict_positive_int($_GET['outcome_id'], 'outcome_id') : 0;
 
     $mstmt = db()->prepare("SELECT id FROM markets WHERE market_id = :mid LIMIT 1");
@@ -370,7 +332,13 @@ function handle_market_history(): void {
     $m = $mstmt->fetch();
     if (!$m) fail('Market not found.', 404);
 
-    $sql = "SELECT outcome_id, probability, odds, volume, created_at FROM market_snapshots WHERE market_id = :mid";
+    // Outcome names lookup
+    $ostmt = db()->prepare("SELECT id, name FROM outcomes WHERE market_id = :mid");
+    $ostmt->execute([':mid' => $m['id']]);
+    $names = [];
+    foreach ($ostmt->fetchAll() as $o) $names[(int)$o['id']] = $o['name'];
+
+    $sql = "SELECT outcome_id, odds, volume, created_at FROM market_snapshots WHERE market_id = :mid";
     $params = [':mid' => (int)$m['id']];
     if ($outcomeFilter > 0) {
         $sql .= " AND outcome_id = :oid";
@@ -383,21 +351,30 @@ function handle_market_history(): void {
     $stmt->execute();
     $rows = array_reverse($stmt->fetchAll());
 
-    $series = [];
+    $grouped = [];
     foreach ($rows as $r) {
-        $series[] = [
-            'outcome_id' => (int)$r['outcome_id'],
-            'probability'=> (float)$r['probability'],
-            'odds'       => (float)$r['odds'],
-            'volume'     => (float)$r['volume'],
-            'time'       => $r['created_at'],
+        $oid = (int)$r['outcome_id'];
+        if (!isset($grouped[$oid])) $grouped[$oid] = [];
+        $grouped[$oid][] = [
+            'time'   => $r['created_at'],
+            'odds'   => (float)$r['odds'],
+            'volume' => (float)$r['volume'],
+        ];
+    }
+
+    $outcomes = [];
+    foreach ($grouped as $oid => $series) {
+        $outcomes[] = [
+            'outcome_id'   => $oid,
+            'outcome_name' => $names[$oid] ?? null,
+            'series'       => $series,
         ];
     }
 
     ok([
         'market_id' => $mid,
-        'history'   => $series,
-        'count'     => count($series),
+        'outcomes'  => $outcomes,
+        'count'     => count($rows),
     ]);
 }
 
@@ -895,107 +872,145 @@ function handle_admin_settle_market(array $body): void {
         $m = _admin_market_lock($pdo, $mid);
         if (in_array($m['status'], ['resolved', 'voided'], true)) { $pdo->rollBack(); fail('Market is already in terminal state.', 409); }
 
-        // Validate winning outcome
         $owin = $pdo->prepare("SELECT id, name FROM outcomes WHERE id = :oid AND market_id = :mid LIMIT 1");
         $owin->execute([':oid' => $winOid, ':mid' => $m['id']]);
         $winRow = $owin->fetch();
         if (!$winRow) { $pdo->rollBack(); fail('Winning outcome does not belong to this market.', 422); }
 
-        // Winners: open bets on winning outcome
         $wstmt = $pdo->prepare("SELECT id, user_id, stake, possible_win, is_bonus_bet FROM bets WHERE market_id = :mid AND status = 'open' AND outcome_id = :oid FOR UPDATE");
         $wstmt->execute([':mid' => $m['id'], ':oid' => $winOid]);
         $winners = $wstmt->fetchAll();
 
-        // Losers: open bets on other outcomes
         $lstmt = $pdo->prepare("SELECT id, user_id, stake, is_bonus_bet FROM bets WHERE market_id = :mid AND status = 'open' AND outcome_id != :oid FOR UPDATE");
         $lstmt->execute([':mid' => $m['id'], ':oid' => $winOid]);
         $losers = $lstmt->fetchAll();
 
-        // Batch winners
+        // Group everything by user_id BEFORE running updates, so we know
+        // exactly which users to snapshot for the ledger.
+        $userIds = [];
+        $realCredit = []; $bonusCredit = []; $realUnlock = []; $bonusUnlock = [];
+        $realWinAdd = [];
+        foreach ($winners as $w) {
+            $uid = (int)$w['user_id']; $userIds[$uid] = true;
+            $payout = (float)$w['possible_win']; $stake = (float)$w['stake'];
+            if ((int)$w['is_bonus_bet'] === 1) {
+                $bonusCredit[$uid] = ($bonusCredit[$uid] ?? 0.0) + $payout;
+                $bonusUnlock[$uid] = ($bonusUnlock[$uid] ?? 0.0) + $stake;
+            } else {
+                $realCredit[$uid]  = ($realCredit[$uid]  ?? 0.0) + $payout;
+                $realUnlock[$uid]  = ($realUnlock[$uid]  ?? 0.0) + $stake;
+                $realWinAdd[$uid]  = ($realWinAdd[$uid]  ?? 0.0) + $payout;
+            }
+        }
+        $loserUnlockReal = []; $loserUnlockBonus = [];
+        foreach ($losers as $l) {
+            $uid = (int)$l['user_id']; $userIds[$uid] = true;
+            $stake = (float)$l['stake'];
+            if ((int)$l['is_bonus_bet'] === 1) $loserUnlockBonus[$uid] = ($loserUnlockBonus[$uid] ?? 0.0) + $stake;
+            else                               $loserUnlockReal[$uid]  = ($loserUnlockReal[$uid]  ?? 0.0) + $stake;
+        }
+
+        // Snapshot affected users' balances BEFORE updates (locked rows for accurate before/after)
+        $balBefore = [];
+        if (!empty($userIds)) {
+            $ids = array_keys($userIds);
+            $ph = implode(',', array_fill(0, count($ids), '?'));
+            $snap = $pdo->prepare("SELECT id, balance, bonus_balance FROM users WHERE id IN ({$ph}) FOR UPDATE");
+            $snap->execute($ids);
+            foreach ($snap->fetchAll() as $r) {
+                $balBefore[(int)$r['id']] = ['balance' => (float)$r['balance'], 'bonus_balance' => (float)$r['bonus_balance']];
+            }
+        }
+
+        // Mark winning bets
         if (!empty($winners)) {
             $winIds = array_map(fn($r) => (int)$r['id'], $winners);
             $ph = implode(',', array_fill(0, count($winIds), '?'));
             $upd = $pdo->prepare("UPDATE bets SET status='won', payout=possible_win WHERE id IN ({$ph})");
             $upd->execute($winIds);
 
-            // Group payouts by user_id (real vs bonus)
-            $realPayouts = []; $bonusPayouts = []; $realUnlock = []; $bonusUnlock = [];
-            $realWinAdd = [];
-            foreach ($winners as $w) {
-                $uid = (int)$w['user_id'];
-                $payout = (float)$w['possible_win'];
-                $stake = (float)$w['stake'];
-                if ((int)$w['is_bonus_bet'] === 1) {
-                    $bonusPayouts[$uid] = ($bonusPayouts[$uid] ?? 0.0) + $payout;
-                    $bonusUnlock[$uid]  = ($bonusUnlock[$uid] ?? 0.0) + $stake;
-                } else {
-                    $realPayouts[$uid] = ($realPayouts[$uid] ?? 0.0) + $payout;
-                    $realUnlock[$uid]  = ($realUnlock[$uid] ?? 0.0) + $stake;
-                    $realWinAdd[$uid]  = ($realWinAdd[$uid] ?? 0.0) + $payout;
-                }
-            }
-
             $uReal = $pdo->prepare("UPDATE users SET balance = balance + :add, locked_balance = locked_balance - :unl, total_wins = total_wins + :win, updated_at=NOW() WHERE id = :uid");
-            foreach ($realPayouts as $uid => $payout) {
+            foreach ($realCredit as $uid => $payout) {
                 $uReal->execute([':add' => $payout, ':unl' => $realUnlock[$uid], ':win' => $realWinAdd[$uid], ':uid' => $uid]);
             }
             $uBonus = $pdo->prepare("UPDATE users SET bonus_balance = bonus_balance + :add, locked_balance = locked_balance - :unl, updated_at=NOW() WHERE id = :uid");
-            foreach ($bonusPayouts as $uid => $payout) {
+            foreach ($bonusCredit as $uid => $payout) {
                 $uBonus->execute([':add' => $payout, ':unl' => $bonusUnlock[$uid], ':uid' => $uid]);
             }
         }
 
-        // Batch losers
+        // Mark losing bets
         if (!empty($losers)) {
             $loseIds = array_map(fn($r) => (int)$r['id'], $losers);
             $ph = implode(',', array_fill(0, count($loseIds), '?'));
             $upd = $pdo->prepare("UPDATE bets SET status='lost', payout=0 WHERE id IN ({$ph})");
             $upd->execute($loseIds);
 
-            $unlockReal = []; $unlockBonus = [];
-            foreach ($losers as $l) {
-                $uid = (int)$l['user_id'];
-                $stake = (float)$l['stake'];
-                if ((int)$l['is_bonus_bet'] === 1) {
-                    $unlockBonus[$uid] = ($unlockBonus[$uid] ?? 0.0) + $stake;
-                } else {
-                    $unlockReal[$uid] = ($unlockReal[$uid] ?? 0.0) + $stake;
-                }
-            }
             $uUnlock = $pdo->prepare("UPDATE users SET locked_balance = locked_balance - :unl, updated_at=NOW() WHERE id = :uid");
-            foreach ($unlockReal as $uid => $unl) $uUnlock->execute([':unl' => $unl, ':uid' => $uid]);
-            foreach ($unlockBonus as $uid => $unl) $uUnlock->execute([':unl' => $unl, ':uid' => $uid]);
+            foreach ($loserUnlockReal as $uid => $unl)  $uUnlock->execute([':unl' => $unl, ':uid' => $uid]);
+            foreach ($loserUnlockBonus as $uid => $unl) $uUnlock->execute([':unl' => $unl, ':uid' => $uid]);
         }
 
         $mUpd = $pdo->prepare("UPDATE markets SET status='resolved', resolve_time=NOW(), updated_at=NOW() WHERE id=:id");
         $mUpd->execute([':id' => $m['id']]);
 
+        // Phone lookup for SMS notifications (post-commit)
+        $phoneMap = [];
+        if (!empty($winners)) {
+            $winUserIds = array_unique(array_map(fn($w) => (int)$w['user_id'], $winners));
+            $ph = implode(',', array_fill(0, count($winUserIds), '?'));
+            $ps = $pdo->prepare("SELECT id, phone FROM users WHERE id IN ({$ph})");
+            $ps->execute($winUserIds);
+            foreach ($ps->fetchAll() as $r) $phoneMap[(int)$r['id']] = (string)$r['phone'];
+        }
+
         $pdo->commit();
 
-        // Post-commit: balance_transactions for each affected user
-        if (!empty($winners)) {
-            foreach ($winners as $w) {
-                record_balance_tx((int)$w['user_id'], 'bet_won', (float)$w['possible_win'], 0.0, 0.0, null, (int)$m['id'], 'Won bet on ' . $winRow['name']);
+        // POST-COMMIT: ledger with accurate before/after, plus winner SMS
+        $totalRealPaid = 0.0; $totalBonusPaid = 0.0;
+        foreach ($realCredit as $uid => $payout) {
+            $bb = $balBefore[$uid]['balance'] ?? 0.0;
+            $ba = $bb + $payout;  // balance increase from real wins
+            record_balance_tx($uid, 'bet_won', $payout, $bb, $ba, null, (int)$m['id'], 'Won real bet on ' . $winRow['name']);
+            $totalRealPaid += $payout;
+            if (!empty($phoneMap[$uid])) {
+                send_sms_now($phoneMap[$uid], "You won KES " . number_format($payout, 2) . " on '{$winRow['name']}'. Balance credited.", $uid, null);
             }
         }
-        if (!empty($losers)) {
-            foreach ($losers as $l) {
-                record_balance_tx((int)$l['user_id'], 'bet_lost', 0.0, 0.0, 0.0, null, (int)$m['id'], 'Lost bet (market settled)');
-            }
+        foreach ($bonusCredit as $uid => $payout) {
+            $bb = $balBefore[$uid]['bonus_balance'] ?? 0.0;
+            $ba = $bb + $payout;
+            record_balance_tx($uid, 'bet_won', $payout, $bb, $ba, null, (int)$m['id'], 'Won bonus bet on ' . $winRow['name']);
+            $totalBonusPaid += $payout;
         }
+        foreach ($losers as $l) {
+            $uid = (int)$l['user_id'];
+            record_balance_tx($uid, 'bet_lost', 0.0, 0.0, 0.0, null, (int)$m['id'], 'Lost bet (market settled)');
+        }
+
+        // Market resolved → chat is no longer needed; purge it.
+        purge_market_chats((int)$m['id']);
+
         audit_log('settle_market', (int)$admin['user_id'], 'market', (int)$m['id'], [
             'winning_outcome_id' => $winOid,
             'winning_outcome_name' => $winRow['name'],
-            'winners_count' => count($winners),
-            'losers_count'  => count($losers),
+            'winners_count'  => count($winners),
+            'losers_count'   => count($losers),
+            'total_paid_real'  => round($totalRealPaid, 2),
+            'total_paid_bonus' => round($totalBonusPaid, 2),
         ]);
 
         ok([
-            'market_id'        => $mid,
-            'status'           => 'resolved',
-            'winning_outcome'  => ['outcome_id' => $winOid, 'name' => $winRow['name']],
-            'winners_count'    => count($winners),
-            'losers_count'     => count($losers),
+            'market_id'       => $mid,
+            'status'          => 'resolved',
+            'winning_outcome' => ['outcome_id' => $winOid, 'name' => $winRow['name']],
+            'winners_count'   => count($winners),
+            'losers_count'    => count($losers),
+            'bets_settled'    => count($winners) + count($losers),
+            'total_payout'    => round($totalRealPaid + $totalBonusPaid, 2),
+            'total_payout_real'  => round($totalRealPaid, 2),
+            'total_payout_bonus' => round($totalBonusPaid, 2),
+            'resolved_at'     => gmdate('Y-m-d H:i:s'),
         ], 'Market settled');
     } catch (Throwable $e) {
         if ($pdo->inTransaction()) $pdo->rollBack();
@@ -1064,6 +1079,8 @@ function handle_admin_void_market(array $body): void {
         foreach ($bets as $b) {
             record_balance_tx((int)$b['user_id'], 'bet_voided', (float)$b['stake'], 0.0, 0.0, null, (int)$m['id'], 'Market voided: ' . $reason);
         }
+        // Market voided → terminal; purge chat.
+        purge_market_chats((int)$m['id']);
         audit_log('void_market', (int)$admin['user_id'], 'market', (int)$m['id'], [
             'reason' => $reason, 'bets_voided' => count($bets),
         ]);
@@ -1427,10 +1444,20 @@ function handle_admin_reseed_odds(array $body): void {
             fail('You must provide odds for every existing outcome (' . count($existing) . ').', 422, ['outcomes']);
         }
         $implied = 0.0;
-        foreach ($body['outcomes'] as $i => $o) {
+        // Build a name→id lookup so callers can identify outcomes by either field.
+        $nameToId = [];
+        foreach ($existing as $ex) $nameToId[mb_strtolower($ex['name'])] = (int)$ex['id'];
+
+        foreach ($body['outcomes'] as $i => &$o) {
             if (!is_array($o)) fail("outcomes[{$i}] must be an object.", 422, ['outcomes']);
-            if (!isset($o['outcome_id'])) fail("outcomes[{$i}].outcome_id required.", 422, ['outcomes']);
+            if (!isset($o['outcome_id']) && isset($o['name']) && is_string($o['name'])) {
+                $key = mb_strtolower(trim($o['name']));
+                if (!isset($nameToId[$key])) fail("outcomes[{$i}] name '{$o['name']}' not found in this market.", 422, ['outcomes']);
+                $o['outcome_id'] = $nameToId[$key];
+            }
+            if (!isset($o['outcome_id'])) fail("outcomes[{$i}].outcome_id or name required.", 422, ['outcomes']);
             $oid = strict_positive_int($o['outcome_id'], "outcomes[{$i}].outcome_id");
+            $o['outcome_id'] = $oid;
             if ((int)$existing[$i]['id'] !== $oid) {
                 $found = false;
                 foreach ($existing as $ex) if ((int)$ex['id'] === $oid) { $found = true; break; }
@@ -1440,6 +1467,7 @@ function handle_admin_reseed_odds(array $body): void {
             $odds = strict_positive_amount($o['odds'], "outcomes[{$i}].odds", 1.01, 1000.0);
             $implied += 1.0 / $odds;
         }
+        unset($o);
 
         if ($m['odds_mode'] === 'fixed') {
             if ($implied < FIXED_MIN_OVERROUND) {
@@ -1563,49 +1591,70 @@ function handle_admin_stats(): void {
     require_admin();
     $pdo = db();
 
-    $userStats = $pdo->query("SELECT COUNT(*) AS total_users, SUM(is_suspended) AS suspended, SUM(messaging_restricted) AS restricted FROM users")->fetch();
-    $balanceStats = $pdo->query("SELECT COALESCE(SUM(balance),0) AS total_balance, COALESCE(SUM(locked_balance),0) AS total_locked, COALESCE(SUM(bonus_balance),0) AS total_bonus FROM users")->fetch();
-    $marketStats = $pdo->query("SELECT
-        COUNT(*) AS total_markets,
-        SUM(CASE WHEN status='open'     THEN 1 ELSE 0 END) AS open_markets,
-        SUM(CASE WHEN status='paused'   THEN 1 ELSE 0 END) AS paused_markets,
-        SUM(CASE WHEN status='closed'   THEN 1 ELSE 0 END) AS closed_markets,
-        SUM(CASE WHEN status='resolved' THEN 1 ELSE 0 END) AS resolved_markets,
-        SUM(CASE WHEN status='voided'   THEN 1 ELSE 0 END) AS voided_markets
+    $users = $pdo->query("SELECT
+        COUNT(*) AS total,
+        SUM(CASE WHEN verified = 1 THEN 1 ELSE 0 END) AS verified,
+        SUM(CASE WHEN role = 'admin' THEN 1 ELSE 0 END) AS admins,
+        SUM(CASE WHEN is_suspended = 1 THEN 1 ELSE 0 END) AS suspended,
+        SUM(CASE WHEN created_at >= CURDATE() THEN 1 ELSE 0 END) AS created_today
+        FROM users")->fetch();
+    $active = $pdo->query("SELECT COUNT(DISTINCT user_id) c FROM auth_tokens WHERE created_at >= CURDATE()")->fetch();
+
+    $markets = $pdo->query("SELECT
+        COUNT(*) AS total,
+        SUM(CASE WHEN status='open'     THEN 1 ELSE 0 END) AS open,
+        SUM(CASE WHEN status='paused'   THEN 1 ELSE 0 END) AS paused,
+        SUM(CASE WHEN status='closed'   THEN 1 ELSE 0 END) AS closed,
+        SUM(CASE WHEN status='resolved' THEN 1 ELSE 0 END) AS resolved,
+        SUM(CASE WHEN status='voided'   THEN 1 ELSE 0 END) AS voided,
+        SUM(CASE WHEN created_at >= CURDATE() THEN 1 ELSE 0 END) AS created_today
         FROM markets")->fetch();
-    $betStats = $pdo->query("SELECT
+
+    $fin = $pdo->query("SELECT
         COUNT(*) AS total_bets,
-        SUM(CASE WHEN status='open' THEN 1 ELSE 0 END) AS open_bets,
-        SUM(CASE WHEN status='won'  THEN 1 ELSE 0 END) AS won_bets,
-        SUM(CASE WHEN status='lost' THEN 1 ELSE 0 END) AS lost_bets,
-        SUM(CASE WHEN status='void' THEN 1 ELSE 0 END) AS void_bets,
-        COALESCE(SUM(stake),0) AS total_stake,
-        COALESCE(SUM(CASE WHEN status='won' THEN payout ELSE 0 END),0) AS total_payout
+        COALESCE(SUM(stake),0) AS total_wagered,
+        COALESCE(SUM(CASE WHEN status='won' THEN payout ELSE 0 END),0) AS total_payouts,
+        COALESCE(SUM(CASE WHEN status='void' THEN payout ELSE 0 END),0) AS total_refunds,
+        SUM(CASE WHEN created_at >= CURDATE() THEN 1 ELSE 0 END) AS bets_today,
+        COALESCE(SUM(CASE WHEN created_at >= CURDATE() THEN stake ELSE 0 END),0) AS wagered_today
         FROM bets")->fetch();
-    $depositStats = $pdo->query("SELECT
-        COUNT(*) AS total_deposits,
-        SUM(CASE WHEN status='completed' THEN amount ELSE 0 END) AS total_completed,
-        SUM(CASE WHEN status='pending'   THEN 1 ELSE 0 END) AS pending,
-        SUM(CASE WHEN status='failed'    THEN 1 ELSE 0 END) AS failed
-        FROM deposits")->fetch();
-    $withdrawalStats = $pdo->query("SELECT
-        COUNT(*) AS total_withdrawals,
-        SUM(CASE WHEN status='completed' THEN amount ELSE 0 END) AS total_completed,
-        SUM(CASE WHEN status='pending'   THEN 1 ELSE 0 END) AS pending,
-        SUM(CASE WHEN status='rejected'  THEN 1 ELSE 0 END) AS rejected
-        FROM withdrawals")->fetch();
-    $notifs = $pdo->query("SELECT COUNT(*) c FROM notifications WHERE is_read = 0")->fetch();
-    $smsCount = $pdo->query("SELECT COUNT(*) c FROM sms_log WHERE created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)")->fetch();
+    $houseProfit = (float)$fin['total_wagered'] - (float)$fin['total_payouts'] - (float)$fin['total_refunds'];
+
+    $topBettors = $pdo->query("SELECT u.username, COALESCE(SUM(b.stake),0) AS total_wagered,
+        COALESCE(SUM(CASE WHEN b.status='won' THEN b.payout ELSE 0 END),0) AS total_wins,
+        COUNT(b.id) AS bet_count
+        FROM bets b JOIN users u ON u.id = b.user_id
+        GROUP BY u.id, u.username
+        ORDER BY total_wagered DESC LIMIT 10")->fetchAll();
 
     ok([
-        'users'        => $userStats,
-        'balances'     => $balanceStats,
-        'markets'      => $marketStats,
-        'bets'         => $betStats,
-        'deposits'     => $depositStats,
-        'withdrawals'  => $withdrawalStats,
-        'unread_alerts'=> (int)$notifs['c'],
-        'sms_30d'      => (int)$smsCount['c'],
+        'users' => [
+            'total'         => (int)$users['total'],
+            'verified'      => (int)$users['verified'],
+            'admins'        => (int)$users['admins'],
+            'suspended'     => (int)$users['suspended'],
+            'active_today'  => (int)$active['c'],
+            'created_today' => (int)$users['created_today'],
+        ],
+        'markets' => [
+            'total'         => (int)$markets['total'],
+            'open'          => (int)$markets['open'],
+            'paused'        => (int)$markets['paused'],
+            'closed'        => (int)$markets['closed'],
+            'resolved'      => (int)$markets['resolved'],
+            'voided'        => (int)$markets['voided'],
+            'created_today' => (int)$markets['created_today'],
+        ],
+        'financials' => [
+            'total_bets'    => (int)$fin['total_bets'],
+            'total_wagered' => (float)$fin['total_wagered'],
+            'total_payouts' => (float)$fin['total_payouts'],
+            'total_refunds' => (float)$fin['total_refunds'],
+            'house_profit'  => round($houseProfit, 2),
+            'bets_today'    => (int)$fin['bets_today'],
+            'wagered_today' => (float)$fin['wagered_today'],
+        ],
+        'top_bettors' => $topBettors,
         'generated_at' => gmdate('Y-m-d H:i:s'),
     ]);
 }
@@ -1632,53 +1681,104 @@ function handle_admin_market_report(): void {
     $betSum->execute([':mid' => $m['id']]);
     $bs = $betSum->fetch();
 
-    $volByOutcome = db()->prepare("SELECT outcome_id, COUNT(*) AS bets, COALESCE(SUM(stake),0) AS volume
+    $volByOutcome = db()->prepare("SELECT outcome_id, COUNT(*) AS bets,
+        COALESCE(SUM(stake),0) AS volume,
+        COALESCE(SUM(CASE WHEN status='open' THEN possible_win ELSE 0 END),0) AS open_liability
         FROM bets WHERE market_id = :mid AND status != 'void' GROUP BY outcome_id");
     $volByOutcome->execute([':mid' => $m['id']]);
     $vols = $volByOutcome->fetchAll();
     $volMap = [];
-    foreach ($vols as $v) $volMap[(int)$v['outcome_id']] = ['bets' => (int)$v['bets'], 'volume' => (float)$v['volume']];
+    foreach ($vols as $v) $volMap[(int)$v['outcome_id']] = [
+        'bets' => (int)$v['bets'], 'volume' => (float)$v['volume'], 'open_liability' => (float)$v['open_liability'],
+    ];
 
-    $outcomesWithVol = [];
+    $volumeByOutcome = [];
     foreach ($snap as $s) {
         $oid = (int)$s['outcome_id'];
-        $s['bets'] = $volMap[$oid]['bets'] ?? 0;
-        $s['volume'] = $volMap[$oid]['volume'] ?? 0.0;
-        $outcomesWithVol[] = $s;
+        $volumeByOutcome[] = [
+            'outcome_id'     => $oid,
+            'outcome_name'   => $s['name'],
+            'bet_count'      => $volMap[$oid]['bets'] ?? 0,
+            'total_staked'   => $volMap[$oid]['volume'] ?? 0.0,
+            'open_liability' => $volMap[$oid]['open_liability'] ?? 0.0,
+        ];
     }
 
-    // Graph summary — bulk fetch first/last snapshot per outcome
-    $graphStmt = db()->prepare("SELECT outcome_id,
-        MIN(created_at) AS first_at, MAX(created_at) AS last_at,
-        COUNT(*) AS samples
-        FROM market_snapshots WHERE market_id = :mid GROUP BY outcome_id");
+    // Max liability across all outcomes (worst-case payout if any one outcome wins)
+    $maxLiability = 0.0;
+    foreach ($volumeByOutcome as $v) {
+        if ($v['open_liability'] > $maxLiability) $maxLiability = $v['open_liability'];
+    }
+    $stakeAtRisk = 0.0;
+    foreach ($vols as $v) { if (true) $stakeAtRisk += (float)$v['volume']; }
+    $houseProfit = (float)$bs['total_stake'] - (float)$bs['total_payout'];
+
+    $graphStmt = db()->prepare("SELECT s.outcome_id, o.name AS outcome_name,
+        MIN(s.created_at) AS first_at, MAX(s.created_at) AS last_at,
+        COUNT(*) AS samples,
+        SUBSTRING_INDEX(GROUP_CONCAT(s.odds ORDER BY s.created_at ASC),  ',', 1) AS opening_odds,
+        SUBSTRING_INDEX(GROUP_CONCAT(s.odds ORDER BY s.created_at DESC), ',', 1) AS current_odds
+        FROM market_snapshots s
+        JOIN outcomes o ON o.id = s.outcome_id
+        WHERE s.market_id = :mid GROUP BY s.outcome_id, o.name");
     $graphStmt->execute([':mid' => $m['id']]);
     $graphRows = $graphStmt->fetchAll();
+    foreach ($graphRows as &$gr) {
+        $gr['opening_odds']   = (float)$gr['opening_odds'];
+        $gr['current_odds']   = (float)$gr['current_odds'];
+        $gr['outcome_id']     = (int)$gr['outcome_id'];
+        $gr['snapshot_count'] = (int)$gr['samples'];
+        unset($gr['samples']);
+    }
+    unset($gr);
 
-    $auditStmt = db()->prepare("SELECT id, admin_id, action, meta, created_at FROM audit_logs WHERE target_type = 'market' AND target_id = :id ORDER BY created_at DESC LIMIT 50");
+    $auditStmt = db()->prepare("SELECT a.id, a.admin_id, u.username AS admin, a.action, a.meta, a.created_at AS at
+        FROM audit_logs a LEFT JOIN users u ON u.id = a.admin_id
+        WHERE a.target_type = 'market' AND a.target_id = :id ORDER BY a.created_at DESC LIMIT 50");
     $auditStmt->execute([':id' => $m['id']]);
     $audit = $auditStmt->fetchAll();
     foreach ($audit as &$a) {
         $a['meta'] = $a['meta'] ? json_decode($a['meta'], true) : null;
+        $a['admin'] = $a['admin'] ?? ($a['admin_id'] == 0 ? 'system' : null);
     }
     unset($a);
 
+    $marketBlock = [
+        'market_id'         => $m['market_id'],
+        'question'          => $m['question'],
+        'category'          => $m['category'],
+        'market_type'       => $m['market_type'],
+        'odds_mode'         => $m['odds_mode'],
+        'status'            => $m['status'],
+        'b'                 => (float)$m['b'],
+        'min_stake'         => (float)$m['min_stake'],
+        'max_stake'         => (float)$m['max_stake'],
+        'max_total_wagered' => (float)$m['max_total_wagered'],
+        'max_odds'          => $m['max_odds'] !== null ? (float)$m['max_odds'] : null,
+        'total_bets'        => (int)$m['total_bets'],
+        'total_wagered'     => (float)$m['total_wagered'],
+        'pause_reason'      => $m['pause_reason'],
+        'void_reason'       => $m['void_reason'],
+        'close_time'        => $m['close_time'],
+        'resolve_time'      => $m['resolve_time'],
+    ];
+
     ok([
-        'market'    => public_market_row($m, $outcomesWithVol),
-        'odds_mode' => $m['odds_mode'],
-        'b'         => (float)$m['b'],
-        'max_odds'  => $m['max_odds'] !== null ? (float)$m['max_odds'] : null,
-        'pause_reason' => $m['pause_reason'],
+        'market'      => $marketBlock,
+        'live_odds'   => $snap,
         'bet_summary' => [
-            'total_bets'   => (int)$bs['total_bets'],
-            'open_bets'    => (int)$bs['open_bets'],
-            'won_bets'     => (int)$bs['won_bets'],
-            'lost_bets'    => (int)$bs['lost_bets'],
-            'void_bets'    => (int)$bs['void_bets'],
-            'total_stake'  => (float)$bs['total_stake'],
-            'total_payout' => (float)$bs['total_payout'],
+            'total_bets'    => (int)$bs['total_bets'],
+            'open'          => (int)$bs['open_bets'],
+            'won'           => (int)$bs['won_bets'],
+            'lost'          => (int)$bs['lost_bets'],
+            'void'          => (int)$bs['void_bets'],
+            'total_staked'  => (float)$bs['total_stake'],
+            'stake_at_risk' => $stakeAtRisk,
+            'max_liability' => $maxLiability,
+            'house_profit'  => round($houseProfit, 2),
         ],
-        'graph_summary' => $graphRows,
-        'audit_log'     => $audit,
+        'volume_by_outcome' => $volumeByOutcome,
+        'graph_summary'     => $graphRows,
+        'audit_log'         => $audit,
     ]);
 }

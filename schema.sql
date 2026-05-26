@@ -227,14 +227,17 @@ CREATE TABLE IF NOT EXISTS deposits (
     amount              DECIMAL(18,2) NOT NULL,
     phone               VARCHAR(20) NOT NULL,
     status              ENUM('pending','completed','failed','cancelled') NOT NULL DEFAULT 'pending',
-    external_reference  VARCHAR(64) NULL,
+    external_reference  VARCHAR(64) NULL,        -- final M-Pesa receipt (UNIQUE, idempotency)
+    client_reference    VARCHAR(64) NULL,        -- our ref sent to PayHero (matches callback ExternalReference)
+    payhero_reference   VARCHAR(64) NULL,        -- PayHero's own reference
     checkout_request_id VARCHAR(100) NULL,
-    provider            VARCHAR(30) NOT NULL DEFAULT 'mpesa',
+    provider            VARCHAR(30) NOT NULL DEFAULT 'payhero',
     note                VARCHAR(300) NOT NULL DEFAULT '',
     created_at          DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     completed_at        DATETIME NULL,
     PRIMARY KEY (id),
     UNIQUE KEY uniq_external_reference (external_reference),
+    UNIQUE KEY uniq_client_reference   (client_reference),
     KEY idx_user_created  (user_id, created_at),
     KEY idx_checkout      (checkout_request_id),
     KEY idx_status        (status),
@@ -303,25 +306,27 @@ CREATE TABLE IF NOT EXISTS stickers (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ============================================================
--- 14. messages
+-- 14. market_chats  (per-market chat; NO user-to-user DMs.
+--     Rows are auto-purged when a market is settled or voided.)
 -- ============================================================
-CREATE TABLE IF NOT EXISTS messages (
-    id                   BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-    from_user_id         BIGINT UNSIGNED NOT NULL,
-    to_user_id           BIGINT UNSIGNED NOT NULL,
-    body                 TEXT NOT NULL,
-    sticker_id           BIGINT UNSIGNED NULL,
-    is_read              TINYINT(1) NOT NULL DEFAULT 0,
-    deleted_by_sender    TINYINT(1) NOT NULL DEFAULT 0,
-    deleted_by_recipient TINYINT(1) NOT NULL DEFAULT 0,
-    created_at           DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+CREATE TABLE IF NOT EXISTS market_chats (
+    id             BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    market_id      BIGINT UNSIGNED NOT NULL,
+    user_id        BIGINT UNSIGNED NOT NULL,
+    body           TEXT NOT NULL,
+    sticker_id     BIGINT UNSIGNED NULL,
+    is_deleted     TINYINT(1) NOT NULL DEFAULT 0,
+    deleted_by     BIGINT UNSIGNED NULL,
+    deleted_reason VARCHAR(200) NULL,
+    created_at     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (id),
-    KEY idx_from_to_created (from_user_id, to_user_id, created_at),
-    KEY idx_to_unread       (to_user_id, is_read),
-    KEY idx_sticker         (sticker_id),
-    CONSTRAINT fk_msg_from    FOREIGN KEY (from_user_id) REFERENCES users(id)    ON DELETE CASCADE,
-    CONSTRAINT fk_msg_to      FOREIGN KEY (to_user_id)   REFERENCES users(id)    ON DELETE CASCADE,
-    CONSTRAINT fk_msg_sticker FOREIGN KEY (sticker_id)   REFERENCES stickers(id) ON DELETE SET NULL
+    KEY idx_market_created (market_id, created_at),
+    KEY idx_user           (user_id),
+    KEY idx_sticker        (sticker_id),
+    CONSTRAINT fk_chat_market  FOREIGN KEY (market_id)  REFERENCES markets(id)  ON DELETE CASCADE,
+    CONSTRAINT fk_chat_user    FOREIGN KEY (user_id)    REFERENCES users(id)    ON DELETE CASCADE,
+    CONSTRAINT fk_chat_deleter FOREIGN KEY (deleted_by) REFERENCES users(id)    ON DELETE SET NULL,
+    CONSTRAINT fk_chat_sticker FOREIGN KEY (sticker_id) REFERENCES stickers(id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ============================================================
@@ -430,6 +435,33 @@ CREATE TABLE IF NOT EXISTS password_reset_tokens (
     CONSTRAINT fk_prt_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+-- ============================================================
+-- 21. manual_deposit_claims
+--     User-submitted M-Pesa codes for deposits that the automatic
+--     callback never confirmed (provider/server downtime). Admin
+--     verifies and credits. transaction_code is globally UNIQUE.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS manual_deposit_claims (
+    id               BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    user_id          BIGINT UNSIGNED NOT NULL,
+    amount           DECIMAL(18,2) NOT NULL,
+    phone            VARCHAR(20) NOT NULL,
+    transaction_code VARCHAR(40) NOT NULL,
+    note             VARCHAR(500) NULL,
+    status           ENUM('pending','approved','rejected') NOT NULL DEFAULT 'pending',
+    reviewed_by      BIGINT UNSIGNED NULL,
+    review_note      VARCHAR(500) NULL,
+    reviewed_at      DATETIME NULL,
+    created_at       DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (id),
+    UNIQUE KEY uniq_mdc_code (transaction_code),
+    KEY idx_mdc_user   (user_id),
+    KEY idx_mdc_status (status),
+    CONSTRAINT fk_mdc_user  FOREIGN KEY (user_id)     REFERENCES users(id),
+    CONSTRAINT fk_mdc_admin FOREIGN KEY (reviewed_by) REFERENCES users(id) ON DELETE SET NULL,
+    CONSTRAINT chk_mdc_amt CHECK (amount > 0)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 SET FOREIGN_KEY_CHECKS = 1;
 
 -- ============================================================
@@ -479,4 +511,5 @@ INSERT IGNORE INTO stickers (name, filename, mime_type, file_size, category, is_
 -- Default system settings row for maintenance_mode
 -- ============================================================
 INSERT IGNORE INTO system_settings (`key`, value, message, updated_at) VALUES
-('maintenance_mode', '0', NULL, NOW());
+('maintenance_mode', '0', NULL, NOW()),
+('deposits_paused',  '0', NULL, NOW());
