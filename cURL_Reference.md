@@ -6,7 +6,7 @@
 **Routing:** `?route=<name>` (query string)
 **Auth:** `Authorization: Bearer <64-hex-token>` (only where stated)
 **Body:** JSON, `Content-Type: application/json`. Max **64 KB**.
-**Discovery:** `GET ?route=routes` returns the live catalogue of every route.
+**Discovery:** `GET ?route=routes` returns the live catalogue of every route — **admin token required** (route enumeration is not public).
 
 ### File layout
 
@@ -79,19 +79,19 @@ curl "https://yourdomain.com/api.php"
   "success": true,
   "data": {
     "name": "MwasinMarket API",
-    "version": "5.4",
+    "version": "5.7",
     "time": "2026-05-23 10:00:00 UTC",
-    "status": "online",
-    "docs": "?route=routes"
+    "status": "online"
   }
 }
 ```
 
-### Routes catalogue (machine-readable)
+### Routes catalogue (admin only)
 ```bash
-curl "https://yourdomain.com/api.php?route=routes"
+curl -H "Authorization: Bearer $ADMIN_TOKEN" \
+  "https://yourdomain.com/api.php?route=routes"
 ```
-Returns `data.routes[]` of `{ route, method, auth, description }` for every endpoint. Use this in your frontend code generator or Postman setup.
+Returns `data.routes[]` of `{ route, method, auth, description }`. Returns **`403`** without an admin token — public exposure was route enumeration.
 
 ### Health check
 ```bash
@@ -1070,22 +1070,70 @@ Errors on post: `403` suspended / messaging-restricted · `404` market or sticke
 
 ---
 
-## 14. Social — Stickers
+## 14. Social — Sticker packs + stickers
 
+Stickers are grouped into **packs**. Four default packs ship: **Sports, Finance, Politics, Reactions** (pack ids 1–4). Admins can create additional packs.
+
+### Public — list packs with their stickers
 ```bash
-# Public — list all active stickers grouped by folder
 curl "https://yourdomain.com/api.php?route=stickers"
+```
+```json
+{
+  "success": true,
+  "data": {
+    "packs": [
+      { "pack_id": 1, "name": "Sports", "slug": "sports", "description": "Default Sports pack",
+        "is_default": true, "sticker_count": 8,
+        "stickers": [
+          { "sticker_id": 1, "name": "trophy", "pack_id": 1, "category": "Sports",
+            "filename": "pack1234_sports_trophy.webp", "mime_type": "image/webp",
+            "file_size": 0, "is_pack_default": true,
+            "url": "https://cdn.example.com/stickers/pack1234_sports_trophy.webp" }
+        ] }
+    ]
+  }
+}
+```
 
-# Admin — upload (multipart/form-data, NOT JSON)
+### Admin — pack management
+```bash
+# Create a new pack (slug auto-derived from name if not provided)
+curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{ "name": "Music", "description": "Songs and gigs", "slug": "music" }' \
+  "https://yourdomain.com/api.php?route=admin_create_sticker_pack"
+
+# Edit pack metadata (any subset of name / description / is_active)
+curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{ "pack_id": 5, "description": "Top hits and live shows", "is_active": true }' \
+  "https://yourdomain.com/api.php?route=admin_edit_sticker_pack"
+
+# Soft-delete a pack (default packs 1–4 cannot be deleted; deactivate instead)
+curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{ "pack_id": 5 }' \
+  "https://yourdomain.com/api.php?route=admin_delete_sticker_pack"
+```
+
+### Admin — upload a sticker into a pack
+Multipart form-data (NOT JSON). Provide `pack_id` (preferred) or `pack_slug`.
+```bash
 curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -F "sticker=@./trophy.webp" -F "name=trophy" -F "category=Sports" \
+  -F "sticker=@./trophy.webp" -F "name=trophy" -F "pack_id=1" \
   "https://yourdomain.com/api.php?route=admin_upload_sticker"
 
-# Admin — soft delete
+# Or by slug
+curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -F "sticker=@./guitar.webp" -F "name=guitar" -F "pack_slug=music" \
+  "https://yourdomain.com/api.php?route=admin_upload_sticker"
+```
+
+### Admin — deactivate a sticker
+```bash
 curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
   -d '{ "sticker_id": 15 }' \
   "https://yourdomain.com/api.php?route=admin_delete_sticker"
 ```
+
 Upload rules: MIME verified by `finfo_file()` — `image/png`, `image/gif`, `image/webp` only. Max **512 KB**, max **512×512 px**, filename always server-generated.
 
 ---
@@ -1444,7 +1492,7 @@ memory_limit = 128M
 
 ## 26. Database schema overview
 
-Twenty-three InnoDB tables. All `utf8mb4_unicode_ci`. Run `schema.sql` once on a fresh MySQL 8.0+ database.
+Twenty-four InnoDB tables. All `utf8mb4_unicode_ci`. Run `schema.sql` once on a fresh MySQL 8.0+ database.
 
 | #  | Table                          | Purpose                                                |
 |----|--------------------------------|--------------------------------------------------------|
@@ -1460,7 +1508,8 @@ Twenty-three InnoDB tables. All `utf8mb4_unicode_ci`. Run `schema.sql` once on a
 | 10 | `deposits`                     | PayHero deposits (UNIQUE `external_reference` + `client_reference`) |
 | 11 | `withdrawals`                  | Withdrawal lifecycle (manual disbursement w/ M-Pesa code) |
 | 12 | `reactions`                    | Heart toggles per user × market                        |
-| 13 | `stickers`                     | Sticker library (soft-delete only)                     |
+| 13a| `sticker_packs`                | Named pack of stickers (4 seeded; admins can add more) |
+| 13b| `stickers`                     | Sticker library (soft-delete only) — linked via pack_id|
 | 14 | `market_chats`                 | Per-market chat (no DMs; auto-purged on resolve/void)  |
 | 15 | `email_log`                    | SMTP send audit (every system / admin email)           |
 | 16 | `user_bans`                    | Ban history (supports multiple ban/unban cycles)       |

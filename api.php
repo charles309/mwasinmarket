@@ -99,13 +99,18 @@ if ($ROUTE === '') {
             'version' => '5.4',
             'time'    => gmdate('Y-m-d H:i:s') . ' UTC',
             'status'  => 'online',
-            'docs'    => '?route=routes',
         ],
     ], JSON_UNESCAPED_UNICODE);
     exit;
 }
 
 if ($ROUTE === 'routes') {
+    // Route catalogue is admin-only — public exposure is route enumeration.
+    $tok = read_bearer();
+    $auth = $tok === '' ? null : resolve_token($tok);
+    if (!$auth || $auth['role'] !== 'admin') {
+        fail('Admin access required.', 403);
+    }
     $ROUTE_CATALOGUE = [
         // [route, method, auth, description]
         ['register',                       'POST', 'public', 'Create account (20/IP/hr)'],
@@ -150,8 +155,11 @@ if ($ROUTE === 'routes') {
         ['delete_market_chat',             'POST', 'user',   'Delete own chat (admin: any)'],
         ['react',                          'POST', 'user',   'Toggle heart on a market'],
         ['reactions',                      'GET',  'public', 'Heart count (and own state if authed)'],
-        ['stickers',                       'GET',  'public', 'List sticker library grouped by folder'],
-        ['admin_upload_sticker',           'POST', 'admin',  'multipart/form-data sticker upload'],
+        ['stickers',                       'GET',  'public', 'List active sticker packs + their stickers'],
+        ['admin_create_sticker_pack',      'POST', 'admin',  'Create a new sticker pack'],
+        ['admin_edit_sticker_pack',        'POST', 'admin',  'Edit pack name / description / is_active'],
+        ['admin_delete_sticker_pack',      'POST', 'admin',  'Soft-delete (deactivate) a non-default pack'],
+        ['admin_upload_sticker',           'POST', 'admin',  'multipart/form-data sticker upload (pack_id or pack_slug required)'],
         ['admin_delete_sticker',           'POST', 'admin',  'Soft-delete a sticker'],
         ['deposit_captcha',                'GET',  'user',   'Get a math captcha before depositing'],
         ['deposit_request',                'POST', 'user',   'PayHero STK Push (captcha + rate-limited)'],
@@ -200,6 +208,8 @@ if ($ROUTE === 'routes') {
     exit;
 }
 
+// Note: 'routes' itself does its own auth check above; we still let it bypass
+// the maintenance gate so admins can introspect during downtime.
 $MAINTENANCE_BYPASS = ['admin_login', 'admin_maintenance', 'health', 'routes'];
 if (!in_array($ROUTE, $MAINTENANCE_BYPASS, true)) {
     check_maintenance();
@@ -255,6 +265,9 @@ try {
         case 'react':                      handle_react($BODY); break;
         case 'reactions':                  handle_reactions(); break;
         case 'stickers':                   handle_stickers_list(); break;
+        case 'admin_create_sticker_pack':  handle_admin_create_sticker_pack($BODY); break;
+        case 'admin_edit_sticker_pack':    handle_admin_edit_sticker_pack($BODY); break;
+        case 'admin_delete_sticker_pack':  handle_admin_delete_sticker_pack($BODY); break;
         case 'admin_upload_sticker':       handle_admin_upload_sticker(); break;
         case 'admin_delete_sticker':       handle_admin_delete_sticker($BODY); break;
 

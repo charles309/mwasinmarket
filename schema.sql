@@ -288,10 +288,36 @@ CREATE TABLE IF NOT EXISTS reactions (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ============================================================
--- 13. stickers
+-- 13a. sticker_packs
+--      A pack is a named collection of stickers. Four packs ship by
+--      default; admins can add more. Stickers may be linked to a pack
+--      (pack_id) or remain stand-alone (NULL).
+-- ============================================================
+CREATE TABLE IF NOT EXISTS sticker_packs (
+    id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    name        VARCHAR(60)  NOT NULL,
+    slug        VARCHAR(60)  NOT NULL,
+    description VARCHAR(300) NOT NULL DEFAULT '',
+    is_active   TINYINT(1)   NOT NULL DEFAULT 1,
+    is_default  TINYINT(1)   NOT NULL DEFAULT 0,
+    created_by  BIGINT UNSIGNED NULL,
+    created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (id),
+    UNIQUE KEY uniq_pack_slug (slug),
+    KEY idx_pack_active (is_active),
+    CONSTRAINT fk_pack_creator FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ============================================================
+-- 13b. stickers
+--      pack_id links a sticker to a pack (NULL = uncategorised /
+--      stand-alone). The legacy `category` string is kept for back-
+--      compat but the pack_id is now the canonical grouping.
 -- ============================================================
 CREATE TABLE IF NOT EXISTS stickers (
     id              BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    pack_id         BIGINT UNSIGNED NULL,
     name            VARCHAR(80)  NOT NULL,
     filename        VARCHAR(64)  NOT NULL,
     mime_type       VARCHAR(20)  NOT NULL,
@@ -303,7 +329,9 @@ CREATE TABLE IF NOT EXISTS stickers (
     created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (id),
     UNIQUE KEY uniq_filename (filename),
+    KEY idx_pack_active      (pack_id, is_active),
     KEY idx_category_active  (category, is_active),
+    CONSTRAINT fk_sticker_pack FOREIGN KEY (pack_id) REFERENCES sticker_packs(id) ON DELETE SET NULL,
     CONSTRAINT fk_stickers_uploader FOREIGN KEY (uploaded_by) REFERENCES users(id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
@@ -503,47 +531,53 @@ CREATE TABLE IF NOT EXISTS support_messages (
 SET FOREIGN_KEY_CHECKS = 1;
 
 -- ============================================================
--- SEED DATA — Pack 1234: 32 stickers across 4 categories
+-- SEED DATA — 4 default sticker packs + 32 stickers (8 per pack).
 -- Physical files must be deployed separately to STICKER_UPLOAD_PATH.
 -- ============================================================
 
-INSERT IGNORE INTO stickers (name, filename, mime_type, file_size, category, is_active, is_pack_default, uploaded_by, created_at) VALUES
+INSERT IGNORE INTO sticker_packs (id, name, slug, description, is_active, is_default, created_by, created_at) VALUES
+(1, 'Sports',    'sports',    'Default Sports pack',    1, 1, NULL, NOW()),
+(2, 'Finance',   'finance',   'Default Finance pack',   1, 1, NULL, NOW()),
+(3, 'Politics',  'politics',  'Default Politics pack',  1, 1, NULL, NOW()),
+(4, 'Reactions', 'reactions', 'Default Reactions pack', 1, 1, NULL, NOW());
+
+INSERT IGNORE INTO stickers (pack_id, name, filename, mime_type, file_size, category, is_active, is_pack_default, uploaded_by, created_at) VALUES
 -- Sports (8)
-('trophy',   'pack1234_sports_trophy.webp',   'image/webp', 0, 'Sports',    1, 1, NULL, NOW()),
-('ball',     'pack1234_sports_ball.webp',     'image/webp', 0, 'Sports',    1, 1, NULL, NOW()),
-('whistle',  'pack1234_sports_whistle.webp',  'image/webp', 0, 'Sports',    1, 1, NULL, NOW()),
-('boot',     'pack1234_sports_boot.webp',     'image/webp', 0, 'Sports',    1, 1, NULL, NOW()),
-('medal',    'pack1234_sports_medal.webp',    'image/webp', 0, 'Sports',    1, 1, NULL, NOW()),
-('fire',     'pack1234_sports_fire.webp',     'image/webp', 0, 'Sports',    1, 1, NULL, NOW()),
-('goal',     'pack1234_sports_goal.webp',     'image/webp', 0, 'Sports',    1, 1, NULL, NOW()),
-('stadium',  'pack1234_sports_stadium.webp',  'image/webp', 0, 'Sports',    1, 1, NULL, NOW()),
+(1, 'trophy',   'pack1234_sports_trophy.webp',   'image/webp', 0, 'Sports',    1, 1, NULL, NOW()),
+(1, 'ball',     'pack1234_sports_ball.webp',     'image/webp', 0, 'Sports',    1, 1, NULL, NOW()),
+(1, 'whistle',  'pack1234_sports_whistle.webp',  'image/webp', 0, 'Sports',    1, 1, NULL, NOW()),
+(1, 'boot',     'pack1234_sports_boot.webp',     'image/webp', 0, 'Sports',    1, 1, NULL, NOW()),
+(1, 'medal',    'pack1234_sports_medal.webp',    'image/webp', 0, 'Sports',    1, 1, NULL, NOW()),
+(1, 'fire',     'pack1234_sports_fire.webp',     'image/webp', 0, 'Sports',    1, 1, NULL, NOW()),
+(1, 'goal',     'pack1234_sports_goal.webp',     'image/webp', 0, 'Sports',    1, 1, NULL, NOW()),
+(1, 'stadium',  'pack1234_sports_stadium.webp',  'image/webp', 0, 'Sports',    1, 1, NULL, NOW()),
 -- Finance (8)
-('chart_up',   'pack1234_finance_chart_up.webp',   'image/webp', 0, 'Finance',   1, 1, NULL, NOW()),
-('chart_down', 'pack1234_finance_chart_down.webp', 'image/webp', 0, 'Finance',   1, 1, NULL, NOW()),
-('money_bag',  'pack1234_finance_money_bag.webp',  'image/webp', 0, 'Finance',   1, 1, NULL, NOW()),
-('coins',      'pack1234_finance_coins.webp',      'image/webp', 0, 'Finance',   1, 1, NULL, NOW()),
-('bank',       'pack1234_finance_bank.webp',       'image/webp', 0, 'Finance',   1, 1, NULL, NOW()),
-('rocket',     'pack1234_finance_rocket.webp',     'image/webp', 0, 'Finance',   1, 1, NULL, NOW()),
-('crash',      'pack1234_finance_crash.webp',      'image/webp', 0, 'Finance',   1, 1, NULL, NOW()),
-('bull',       'pack1234_finance_bull.webp',       'image/webp', 0, 'Finance',   1, 1, NULL, NOW()),
+(2, 'chart_up',   'pack1234_finance_chart_up.webp',   'image/webp', 0, 'Finance',   1, 1, NULL, NOW()),
+(2, 'chart_down', 'pack1234_finance_chart_down.webp', 'image/webp', 0, 'Finance',   1, 1, NULL, NOW()),
+(2, 'money_bag',  'pack1234_finance_money_bag.webp',  'image/webp', 0, 'Finance',   1, 1, NULL, NOW()),
+(2, 'coins',      'pack1234_finance_coins.webp',      'image/webp', 0, 'Finance',   1, 1, NULL, NOW()),
+(2, 'bank',       'pack1234_finance_bank.webp',       'image/webp', 0, 'Finance',   1, 1, NULL, NOW()),
+(2, 'rocket',     'pack1234_finance_rocket.webp',     'image/webp', 0, 'Finance',   1, 1, NULL, NOW()),
+(2, 'crash',      'pack1234_finance_crash.webp',      'image/webp', 0, 'Finance',   1, 1, NULL, NOW()),
+(2, 'bull',       'pack1234_finance_bull.webp',       'image/webp', 0, 'Finance',   1, 1, NULL, NOW()),
 -- Politics (8)
-('vote',      'pack1234_politics_vote.webp',      'image/webp', 0, 'Politics',  1, 1, NULL, NOW()),
-('flag',      'pack1234_politics_flag.webp',      'image/webp', 0, 'Politics',  1, 1, NULL, NOW()),
-('handshake', 'pack1234_politics_handshake.webp', 'image/webp', 0, 'Politics',  1, 1, NULL, NOW()),
-('podium',    'pack1234_politics_podium.webp',    'image/webp', 0, 'Politics',  1, 1, NULL, NOW()),
-('ballot',    'pack1234_politics_ballot.webp',    'image/webp', 0, 'Politics',  1, 1, NULL, NOW()),
-('wave',      'pack1234_politics_wave.webp',      'image/webp', 0, 'Politics',  1, 1, NULL, NOW()),
-('crown',     'pack1234_politics_crown.webp',     'image/webp', 0, 'Politics',  1, 1, NULL, NOW()),
-('scale',     'pack1234_politics_scale.webp',     'image/webp', 0, 'Politics',  1, 1, NULL, NOW()),
+(3, 'vote',      'pack1234_politics_vote.webp',      'image/webp', 0, 'Politics',  1, 1, NULL, NOW()),
+(3, 'flag',      'pack1234_politics_flag.webp',      'image/webp', 0, 'Politics',  1, 1, NULL, NOW()),
+(3, 'handshake', 'pack1234_politics_handshake.webp', 'image/webp', 0, 'Politics',  1, 1, NULL, NOW()),
+(3, 'podium',    'pack1234_politics_podium.webp',    'image/webp', 0, 'Politics',  1, 1, NULL, NOW()),
+(3, 'ballot',    'pack1234_politics_ballot.webp',    'image/webp', 0, 'Politics',  1, 1, NULL, NOW()),
+(3, 'wave',      'pack1234_politics_wave.webp',      'image/webp', 0, 'Politics',  1, 1, NULL, NOW()),
+(3, 'crown',     'pack1234_politics_crown.webp',     'image/webp', 0, 'Politics',  1, 1, NULL, NOW()),
+(3, 'scale',     'pack1234_politics_scale.webp',     'image/webp', 0, 'Politics',  1, 1, NULL, NOW()),
 -- Reactions (8)
-('heart',     'pack1234_reactions_heart.webp',    'image/webp', 0, 'Reactions', 1, 1, NULL, NOW()),
-('clap',      'pack1234_reactions_clap.webp',     'image/webp', 0, 'Reactions', 1, 1, NULL, NOW()),
-('shock',     'pack1234_reactions_shock.webp',    'image/webp', 0, 'Reactions', 1, 1, NULL, NOW()),
-('laugh',     'pack1234_reactions_laugh.webp',    'image/webp', 0, 'Reactions', 1, 1, NULL, NOW()),
-('cry',       'pack1234_reactions_cry.webp',      'image/webp', 0, 'Reactions', 1, 1, NULL, NOW()),
-('think',     'pack1234_reactions_think.webp',    'image/webp', 0, 'Reactions', 1, 1, NULL, NOW()),
-('salute',    'pack1234_reactions_salute.webp',   'image/webp', 0, 'Reactions', 1, 1, NULL, NOW()),
-('facepalm',  'pack1234_reactions_facepalm.webp', 'image/webp', 0, 'Reactions', 1, 1, NULL, NOW());
+(4, 'heart',     'pack1234_reactions_heart.webp',    'image/webp', 0, 'Reactions', 1, 1, NULL, NOW()),
+(4, 'clap',      'pack1234_reactions_clap.webp',     'image/webp', 0, 'Reactions', 1, 1, NULL, NOW()),
+(4, 'shock',     'pack1234_reactions_shock.webp',    'image/webp', 0, 'Reactions', 1, 1, NULL, NOW()),
+(4, 'laugh',     'pack1234_reactions_laugh.webp',    'image/webp', 0, 'Reactions', 1, 1, NULL, NOW()),
+(4, 'cry',       'pack1234_reactions_cry.webp',      'image/webp', 0, 'Reactions', 1, 1, NULL, NOW()),
+(4, 'think',     'pack1234_reactions_think.webp',    'image/webp', 0, 'Reactions', 1, 1, NULL, NOW()),
+(4, 'salute',    'pack1234_reactions_salute.webp',   'image/webp', 0, 'Reactions', 1, 1, NULL, NOW()),
+(4, 'facepalm',  'pack1234_reactions_facepalm.webp', 'image/webp', 0, 'Reactions', 1, 1, NULL, NOW());
 
 -- ============================================================
 -- Default system settings row for maintenance_mode
