@@ -228,7 +228,7 @@ function handle_withdrawal_request(array $body): void {
         $wid = (int)$pdo->lastInsertId();
         $pdo->commit();
 
-        send_sms_now($phone, "Your withdrawal request of KES " . number_format($amount, 2) . " has been received and is being processed.", (int)$auth['user_id'], null);
+        notify_user((int)$auth['user_id'], 'Withdrawal request received', "Your withdrawal request of KES " . number_format($amount, 2) . " has been received and is being processed. You will get another email once it has been paid.");
         audit_log('withdrawal_requested', 0, 'user', (int)$auth['user_id'], ['withdrawal_id' => $wid, 'amount' => $amount]);
         create_notification('withdrawal_pending', "New withdrawal request of KES " . number_format($amount, 2), $wid);
 
@@ -339,7 +339,7 @@ function handle_admin_approve_withdrawal(array $body): void {
 
         record_balance_tx($userId, 'withdrawal', -$amount, $balBefore, $balBefore - $amount, $code, null, $note);
         audit_log('approve_withdrawal', (int)$admin['user_id'], 'user', $userId, ['withdrawal_id' => $wid, 'amount' => $amount, 'transaction_code' => $code]);
-        send_sms_now((string)$w['phone'], "Your withdrawal of KES " . number_format($amount, 2) . " has been sent. M-Pesa ref: {$code}.", $userId, null);
+        notify_user($userId, 'Withdrawal sent', "Your withdrawal of KES " . number_format($amount, 2) . " has been sent.\nM-Pesa confirmation code: {$code}", (int)$admin['user_id']);
 
         ok([
             'withdrawal_id'    => $wid,
@@ -389,7 +389,7 @@ function handle_admin_reject_withdrawal(array $body): void {
         $pdo->commit();
 
         audit_log('reject_withdrawal', (int)$admin['user_id'], 'user', $userId, ['withdrawal_id' => $wid, 'amount' => $amount, 'reason' => $reason]);
-        send_sms_now((string)$w['phone'], "Your withdrawal request of KES " . number_format($amount, 2) . " has been declined. Reason: {$reason}", $userId, null);
+        notify_user($userId, 'Withdrawal request declined', "Your withdrawal request of KES " . number_format($amount, 2) . " has been declined.\nReason: {$reason}\n\nThe locked amount has been returned to your available balance.", (int)$admin['user_id']);
 
         ok([
             'withdrawal_id' => $wid,
@@ -638,7 +638,7 @@ function handle_admin_approve_manual_claim(array $body): void {
 
         record_balance_tx($userId, 'deposit', $amount, $balBefore, $balBefore + $amount, $code, null, 'Manual claim approved');
         audit_log('approve_manual_claim', (int)$admin['user_id'], 'user', $userId, ['claim_id' => $claimId, 'amount' => $amount, 'code' => $code]);
-        send_sms_now((string)$claim['phone'], "Your deposit of KES " . number_format($amount, 2) . " has been credited. Ref: {$code}.", $userId, null);
+        notify_user($userId, 'Deposit credited', "Your manual deposit claim of KES " . number_format($amount, 2) . " has been verified and credited.\nM-Pesa ref: {$code}", (int)$admin['user_id']);
 
         ok([
             'claim_id'      => $claimId,

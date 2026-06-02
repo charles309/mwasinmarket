@@ -107,7 +107,7 @@ try {
         record_balance_tx($userId, 'deposit', $amount, $balBefore, $balBefore + $amount, $receipt, null, 'PayHero deposit');
         audit_log('payhero_deposit_confirmed', 0, 'user', $userId, ['deposit_id' => (int)$dep['id'], 'amount' => $amount, 'receipt' => $receipt]);
         create_notification('deposit_completed', "Deposit of KES " . number_format($amount, 2) . " confirmed.", $userId);
-        send_sms_now((string)$dep['phone'], "Your deposit of KES " . number_format($amount, 2) . " has been confirmed. Ref: {$receipt}.", $userId, null);
+        notify_user($userId, 'Deposit confirmed', "Your deposit of KES " . number_format($amount, 2) . " has been confirmed and credited.\nM-Pesa ref: {$receipt}");
 
         _cb_done(['status' => true, 'received' => true, 'credited' => true]);
     }

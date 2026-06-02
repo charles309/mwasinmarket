@@ -987,28 +987,16 @@ function handle_admin_settle_market(array $body): void {
         $mUpd = $pdo->prepare("UPDATE markets SET status='resolved', resolve_time=NOW(), updated_at=NOW() WHERE id=:id");
         $mUpd->execute([':id' => $m['id']]);
 
-        // Phone lookup for SMS notifications (post-commit)
-        $phoneMap = [];
-        if (!empty($winners)) {
-            $winUserIds = array_unique(array_map(fn($w) => (int)$w['user_id'], $winners));
-            $ph = implode(',', array_fill(0, count($winUserIds), '?'));
-            $ps = $pdo->prepare("SELECT id, phone FROM users WHERE id IN ({$ph})");
-            $ps->execute($winUserIds);
-            foreach ($ps->fetchAll() as $r) $phoneMap[(int)$r['id']] = (string)$r['phone'];
-        }
-
         $pdo->commit();
 
-        // POST-COMMIT: ledger with accurate before/after, plus winner SMS
+        // POST-COMMIT: ledger with accurate before/after, plus winner email notifications
         $totalRealPaid = 0.0; $totalBonusPaid = 0.0;
         foreach ($realCredit as $uid => $payout) {
             $bb = $balBefore[$uid]['balance'] ?? 0.0;
             $ba = $bb + $payout;  // balance increase from real wins
             record_balance_tx($uid, 'bet_won', $payout, $bb, $ba, null, (int)$m['id'], 'Won real bet on ' . $winRow['name']);
             $totalRealPaid += $payout;
-            if (!empty($phoneMap[$uid])) {
-                send_sms_now($phoneMap[$uid], "You won KES " . number_format($payout, 2) . " on '{$winRow['name']}'. Balance credited.", $uid, null);
-            }
+            notify_user($uid, 'You won a bet!', "You won KES " . number_format($payout, 2) . " on '{$winRow['name']}'. Your balance has been credited.");
         }
         foreach ($bonusCredit as $uid => $payout) {
             $bb = $balBefore[$uid]['bonus_balance'] ?? 0.0;

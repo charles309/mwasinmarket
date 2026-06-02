@@ -416,58 +416,71 @@ function check_maintenance(): void {
 }
 
 // ============================================================
-// SMS (Africa's Talking)
+// USER NOTIFICATIONS (email via SMTP; no SMS provider)
 // ============================================================
 
+/**
+ * Wrap a short plain-text notification in a minimal HTML envelope.
+ */
+function _notif_html(string $heading, string $bodyText): string {
+    $h = htmlspecialchars($heading, ENT_QUOTES, 'UTF-8');
+    $b = nl2br(htmlspecialchars($bodyText, ENT_QUOTES, 'UTF-8'));
+    return "<!DOCTYPE html><html><body style='font-family:Arial,sans-serif;background:#f6f8fb;padding:24px'>
+        <div style='max-width:560px;margin:auto;background:#fff;border-radius:8px;padding:24px'>
+          <h2 style='color:#2b6cb0;margin:0 0 12px'>{$h}</h2>
+          <p style='color:#222;line-height:1.5'>{$b}</p>
+          <hr style='border:none;border-top:1px solid #eee;margin:18px 0'>
+          <p style='font-size:12px;color:#777'>This is an automated message from MwasinMarket.</p>
+        </div></body></html>";
+}
 
-if (!function_exists('send_sms_now')) {
-    function send_sms_now(string $phone, string $message, ?int $userId = null, ?int $sentBy = null): array {
-        $phone = trim($phone);
-        $message = mb_substr($message, 0, 160, 'UTF-8');
-
-        $logIns = db()->prepare("INSERT INTO sms_log (user_id, phone, message, status, provider, sent_by, created_at) VALUES (:uid, :ph, :msg, 'queued', :prov, :sb, NOW())");
-        $logIns->execute([':uid' => $userId, ':ph' => $phone, ':msg' => $message, ':prov' => SMS_PROVIDER, ':sb' => $sentBy]);
-        $logId = (int)db()->lastInsertId();
-
-        if (SMS_PROVIDER === 'africastalking' && SMS_API_KEY !== '' && SMS_USERNAME !== '') {
-            $url = 'https://api.africastalking.com/version1/messaging';
-            $postData = http_build_query([
-                'username' => SMS_USERNAME,
-                'to'       => $phone,
-                'message'  => $message,
-                'from'     => SMS_SENDER_ID,
-            ]);
-            $ctx = stream_context_create([
-                'http' => [
-                    'method'  => 'POST',
-                    'header'  => "Content-Type: application/x-www-form-urlencoded\r\nAccept: application/json\r\napiKey: " . SMS_API_KEY . "\r\n",
-                    'content' => $postData,
-                    'timeout' => 8,
-                    'ignore_errors' => true,
-                ],
-            ]);
-            $response = @file_get_contents($url, false, $ctx);
-            $providerId = null;
-            $status = 'sent';
-            $error = null;
-            if ($response === false) {
-                $status = 'failed'; $error = 'No response from provider';
-            } else {
-                $data = json_decode($response, true);
-                if (is_array($data) && isset($data['SMSMessageData']['Recipients'][0]['messageId'])) {
-                    $providerId = (string)$data['SMSMessageData']['Recipients'][0]['messageId'];
-                } else {
-                    $status = 'failed'; $error = mb_substr((string)$response, 0, 300, 'UTF-8');
-                }
-            }
-            $upd = db()->prepare("UPDATE sms_log SET status = :st, provider_id = :pid, error = :err WHERE id = :id");
-            $upd->execute([':st' => $status, ':pid' => $providerId, ':err' => $error, ':id' => $logId]);
-            return ['id' => $logId, 'status' => $status, 'provider_id' => $providerId, 'error' => $error];
-        }
-
-        // No provider configured: leave as queued, return as queued
-        return ['id' => $logId, 'status' => 'queued', 'provider_id' => null, 'error' => null];
+/**
+ * Send an email notification to a user. Looks up email + username by user_id,
+ * sends via SMTP, and writes an email_log row. Safe to call inside handlers —
+ * returns ['ok'=>bool, ...] and never throws.
+ */
+function notify_user(int $userId, string $subject, string $bodyText, ?int $sentBy = null): array {
+    $subject = mb_substr(trim($subject), 0, 200, 'UTF-8');
+    if ($subject === '' || $userId <= 0) {
+        return ['ok' => false, 'error' => 'invalid input'];
     }
+
+    try {
+        $st = db()->prepare("SELECT email, username FROM users WHERE id = :uid LIMIT 1");
+        $st->execute([':uid' => $userId]);
+        $u = $st->fetch();
+    } catch (Throwable $e) {
+        error_log('[MwasinMarket] notify_user lookup failed: ' . $e->getMessage());
+        return ['ok' => false, 'error' => 'lookup failed'];
+    }
+    if (!$u || empty($u['email'])) {
+        return ['ok' => false, 'error' => 'no email on file'];
+    }
+
+    $logId = 0;
+    try {
+        $li = db()->prepare("INSERT INTO email_log (user_id, email, subject, status, sent_by, created_at) VALUES (:uid, :em, :sub, 'queued', :sb, NOW())");
+        $li->execute([':uid' => $userId, ':em' => $u['email'], ':sub' => $subject, ':sb' => $sentBy]);
+        $logId = (int)db()->lastInsertId();
+    } catch (Throwable $e) {
+        error_log('[MwasinMarket] email_log queue failed: ' . $e->getMessage());
+    }
+
+    $html = _notif_html($subject, $bodyText);
+    $res = smtp_send_mail((string)$u['email'], $subject, $html);
+
+    if ($logId > 0) {
+        try {
+            $upd = db()->prepare("UPDATE email_log SET status = :st, error = :err WHERE id = :id");
+            $upd->execute([
+                ':st'  => $res['ok'] ? 'sent' : 'failed',
+                ':err' => $res['ok'] ? null  : mb_substr((string)($res['error'] ?? 'send failed'), 0, 250, 'UTF-8'),
+                ':id'  => $logId,
+            ]);
+        } catch (Throwable $e) { /* ignore */ }
+    }
+
+    return ['ok' => (bool)$res['ok'], 'log_id' => $logId, 'email' => $u['email'], 'error' => $res['error'] ?? null];
 }
 
 // ============================================================

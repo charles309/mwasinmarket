@@ -53,7 +53,7 @@
 12. [Social — Reactions](#12-social--reactions)
 13. [Social — Market Chat](#13-social--market-chat)
 14. [Social — Stickers](#14-social--stickers)
-15. [Social — SMS](#15-social--sms)
+15. [Notifications — Email (SMTP)](#15-notifications--email-smtp)
 16. [Admin — User controls](#16-admin--user-controls)
 17. [Maintenance mode](#17-maintenance-mode)
 18. [Notifications](#18-notifications)
@@ -1090,22 +1090,32 @@ Upload rules: MIME verified by `finfo_file()` — `image/png`, `image/gif`, `ima
 
 ---
 
-## 15. Social — SMS
+## 15. Notifications — Email (SMTP)
+
+All user notifications (deposit confirmed, withdrawal sent/declined, ticket reply,
+bet won, etc.) are sent via the configured SMTP server (Outlook STARTTLS by default).
+There is no SMS provider — every channel uses email. Each send is logged in `email_log`.
 
 ```bash
 # Single user
 curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
-  -d '{ "user_id": 5, "message": "Your withdrawal is ready." }' \
-  "https://yourdomain.com/api.php?route=admin_send_sms"
+  -d '{ "user_id": 5, "subject": "Your withdrawal is ready", "body": "Hi Charles, your KES 500 is being processed." }' \
+  "https://yourdomain.com/api.php?route=admin_send_email"
 
-# Broadcast (max 500 per call)
+# Broadcast (max 500 per call). Optional filter: role + email_verified_only.
 curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
-  -d '{ "broadcast": true, "filter": { "role": "user" }, "message": "New market open!" }' \
-  "https://yourdomain.com/api.php?route=admin_send_sms"
+  -d '{ "broadcast": true, "filter": { "role": "user", "email_verified_only": true },
+        "subject": "New markets are live", "body": "Check out today’s lineup..." }' \
+  "https://yourdomain.com/api.php?route=admin_send_email"
 
 # History
 curl -H "Authorization: Bearer $ADMIN_TOKEN" \
-  "https://yourdomain.com/api.php?route=admin_sms_history&status=sent"
+  "https://yourdomain.com/api.php?route=admin_email_history&status=sent"
+```
+Response:
+```json
+{ "success": true, "message": "Email dispatched",
+  "data": { "queued": 1, "sent": 1, "failed": 0, "recipients": ["charles@example.com"] } }
 ```
 
 ---
@@ -1370,11 +1380,7 @@ DEBUG_MODE                false
 STICKER_UPLOAD_PATH       /var/www/stickers
 STICKER_BASE_URL          https://cdn.mwasinmarket.com/stickers
 
-# SMS (Africa's Talking)
-SMS_PROVIDER              africastalking
-SMS_API_KEY               <…>
-SMS_USERNAME              <…>
-SMS_SENDER_ID             MwasinMkt
+# Notifications: SMTP only (no SMS provider).
 
 # PayHero (M-Pesa STK deposits)
 PAYHERO_AUTH_TOKEN        <base64 part only, WITHOUT the word "Basic">
@@ -1456,7 +1462,7 @@ Twenty-three InnoDB tables. All `utf8mb4_unicode_ci`. Run `schema.sql` once on a
 | 12 | `reactions`                    | Heart toggles per user × market                        |
 | 13 | `stickers`                     | Sticker library (soft-delete only)                     |
 | 14 | `market_chats`                 | Per-market chat (no DMs; auto-purged on resolve/void)  |
-| 15 | `sms_log`                      | Sent SMS audit (Africa's Talking)                      |
+| 15 | `email_log`                    | SMTP send audit (every system / admin email)           |
 | 16 | `user_bans`                    | Ban history (supports multiple ban/unban cycles)       |
 | 17 | `system_settings`              | Key-value (maintenance_mode, deposits_paused)          |
 | 18 | `notifications`                | Admin alert queue                                      |

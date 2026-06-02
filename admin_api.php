@@ -1,18 +1,19 @@
 <?php
 declare(strict_types=1);
 
-/** MwasinMarket — Admin SMS, user controls, maintenance, notifications. Requires config.php + bootstrap.php. */
+/** MwasinMarket — Admin email, user controls, maintenance, notifications. Requires config.php + bootstrap.php. */
 
-function handle_admin_send_sms(array $body): void {
+function handle_admin_send_email(array $body): void {
     $admin = require_admin();
-    require_fields($body, ['message']);
-    $message = validate_text($body['message'], 'message', 1, 160);
+    require_fields($body, ['subject', 'body']);
+    $subject = validate_text($body['subject'], 'subject', 3, 200);
+    $message = validate_text($body['body'], 'body', 1, 5000);
 
     $broadcast = !empty($body['broadcast']);
     $recipients = [];
     if ($broadcast) {
         $filter = is_array($body['filter'] ?? null) ? $body['filter'] : [];
-        $where = ['is_suspended = 0', "phone IS NOT NULL", "phone != ''"];
+        $where = ['is_suspended = 0', "email IS NOT NULL", "email != ''"];
         $params = [];
         if (isset($filter['role'])) {
             $role = $filter['role'];
@@ -20,31 +21,33 @@ function handle_admin_send_sms(array $body): void {
             $where[] = 'role = :role';
             $params[':role'] = $role;
         }
-        $sql = "SELECT id, phone FROM users WHERE " . implode(' AND ', $where) . " ORDER BY id ASC LIMIT 500";
+        if (!empty($filter['email_verified_only'])) {
+            $where[] = 'email_verified = 1';
+        }
+        $sql = "SELECT id, email FROM users WHERE " . implode(' AND ', $where) . " ORDER BY id ASC LIMIT 500";
         $stmt = db()->prepare($sql);
         $stmt->execute($params);
         $recipients = $stmt->fetchAll();
     } else {
         require_fields($body, ['user_id']);
         $uid = strict_positive_int($body['user_id'], 'user_id');
-        $u = db()->prepare("SELECT id, phone FROM users WHERE id = :id LIMIT 1");
+        $u = db()->prepare("SELECT id, email FROM users WHERE id = :id LIMIT 1");
         $u->execute([':id' => $uid]);
         $row = $u->fetch();
         if (!$row) fail('User not found.', 404);
-        if (empty($row['phone'])) fail('User has no phone number.', 422);
+        if (empty($row['email'])) fail('User has no email on file.', 422);
         $recipients = [$row];
     }
 
     $queued = 0; $sent = 0; $failed = 0;
     $sample = [];
     foreach ($recipients as $r) {
-        $res = send_sms_now((string)$r['phone'], $message, (int)$r['id'], (int)$admin['user_id']);
+        $res = notify_user((int)$r['id'], $subject, $message, (int)$admin['user_id']);
         $queued++;
-        if ($res['status'] === 'sent') $sent++;
-        elseif ($res['status'] === 'failed') $failed++;
-        if (count($sample) < 10) $sample[] = $r['phone'];
+        if (!empty($res['ok'])) $sent++; else $failed++;
+        if (count($sample) < 10) $sample[] = $r['email'];
     }
-    audit_log('admin_send_sms', (int)$admin['user_id'], 'sms', null, [
+    audit_log('admin_send_email', (int)$admin['user_id'], 'email', null, [
         'broadcast' => $broadcast, 'recipients' => $queued, 'sent' => $sent, 'failed' => $failed,
     ]);
     ok([
@@ -52,10 +55,10 @@ function handle_admin_send_sms(array $body): void {
         'sent'       => $sent,
         'failed'     => $failed,
         'recipients' => $sample,
-    ], 'SMS dispatched');
+    ], 'Email dispatched');
 }
 
-function handle_admin_sms_history(): void {
+function handle_admin_email_history(): void {
     require_admin();
     $page  = max(1, (int)($_GET['page'] ?? 1));
     $limit = min(200, max(1, (int)($_GET['limit'] ?? 50)));
@@ -65,20 +68,20 @@ function handle_admin_sms_history(): void {
     $where = []; $params = [];
     if ($status !== '') {
         if (!in_array($status, ['queued', 'sent', 'failed'], true)) fail('Invalid status filter.', 422);
-        $where[] = 's.status = :st';
+        $where[] = 'e.status = :st';
         $params[':st'] = $status;
     }
     $whereSql = !empty($where) ? 'WHERE ' . implode(' AND ', $where) : '';
 
-    $countQ = db()->prepare("SELECT COUNT(*) c FROM sms_log s {$whereSql}");
+    $countQ = db()->prepare("SELECT COUNT(*) c FROM email_log e {$whereSql}");
     $countQ->execute($params);
     $total = (int)$countQ->fetch()['c'];
 
-    $sql = "SELECT s.id, s.user_id, s.phone, s.message, s.status, s.provider, s.provider_id, s.sent_by, s.error, s.created_at, u.username
-        FROM sms_log s
-        LEFT JOIN users u ON u.id = s.user_id
+    $sql = "SELECT e.id, e.user_id, e.email, e.subject, e.status, e.sent_by, e.error, e.created_at, u.username
+        FROM email_log e
+        LEFT JOIN users u ON u.id = e.user_id
         {$whereSql}
-        ORDER BY s.created_at DESC
+        ORDER BY e.created_at DESC
         LIMIT :lim OFFSET :off";
     $stmt = db()->prepare($sql);
     foreach ($params as $k => $v) $stmt->bindValue($k, $v);
@@ -86,10 +89,6 @@ function handle_admin_sms_history(): void {
     $stmt->bindValue(':off', $offset, PDO::PARAM_INT);
     $stmt->execute();
     $rows = $stmt->fetchAll();
-    foreach ($rows as &$r) {
-        $r['preview'] = mb_substr((string)$r['message'], 0, 60, 'UTF-8');
-    }
-    unset($r);
     ok([
         'data' => $rows,
         'meta' => ['total' => $total, 'page' => $page, 'limit' => $limit, 'pages' => (int)ceil(max(1, $total) / $limit)],

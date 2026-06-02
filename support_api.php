@@ -288,12 +288,15 @@ function handle_admin_support_reply(array $body): void {
     require_fields($body, ['ticket_id', 'body']);
     $ticketId = strict_positive_int($body['ticket_id'], 'ticket_id');
     $message  = validate_text($body['body'], 'body', 1, 2000);
-    $notify   = !empty($body['notify_sms']);
+    // Accept either name for back-compat; default ON (admin replies usually want a heads-up email).
+    $notify = array_key_exists('notify_email', $body)
+        ? (bool)$body['notify_email']
+        : (array_key_exists('notify_sms', $body) ? (bool)$body['notify_sms'] : true);
 
     $pdo = db();
     try {
         $pdo->beginTransaction();
-        $st = $pdo->prepare("SELECT t.*, u.phone FROM support_tickets t JOIN users u ON u.id = t.user_id WHERE t.id = :id FOR UPDATE");
+        $st = $pdo->prepare("SELECT t.* FROM support_tickets t WHERE t.id = :id FOR UPDATE");
         $st->execute([':id' => $ticketId]);
         $t = $st->fetch();
         if (!$t) { $pdo->rollBack(); fail('Ticket not found.', 404); }
@@ -307,8 +310,8 @@ function handle_admin_support_reply(array $body): void {
         $pdo->commit();
 
         audit_log('support_reply', (int)$admin['user_id'], 'ticket', $ticketId, ['user_id' => (int)$t['user_id']]);
-        if ($notify && !empty($t['phone'])) {
-            send_sms_now((string)$t['phone'], "MwasinMarket support has replied to your ticket #{$ticketId}. Open the app to read.", (int)$t['user_id'], (int)$admin['user_id']);
+        if ($notify) {
+            notify_user((int)$t['user_id'], 'MwasinMarket support replied to your ticket', "We've replied to your support ticket #{$ticketId}. Sign in to read the message and continue the conversation.", (int)$admin['user_id']);
         }
         ok(['ticket_id' => $ticketId, 'status' => 'answered'], 'Reply sent to the user', 201);
     } catch (Throwable $e) {

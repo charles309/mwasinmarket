@@ -177,8 +177,8 @@ if ($ROUTE === 'routes') {
         ['admin_support_thread',           'GET',  'admin',  'Read a ticket thread'],
         ['admin_support_reply',            'POST', 'admin',  'Reply privately to one user'],
         ['admin_support_close',            'POST', 'admin',  'Close a ticket'],
-        ['admin_send_sms',                 'POST', 'admin',  'Send SMS to user or broadcast'],
-        ['admin_sms_history',              'GET',  'admin',  'View sent SMS log'],
+        ['admin_send_email',               'POST', 'admin',  'Send email to user or broadcast (SMTP)'],
+        ['admin_email_history',            'GET',  'admin',  'View sent email log'],
         ['admin_ban_user',                 'POST', 'admin',  'Full account ban'],
         ['admin_unban_user',               'POST', 'admin',  'Lift ban'],
         ['admin_restrict_messaging',       'POST', 'admin',  'Toggle messaging restriction'],
@@ -287,8 +287,8 @@ try {
         case 'admin_support_close':           handle_admin_support_close($BODY); break;
 
         // Admin — SMS, user controls, maintenance, notifications
-        case 'admin_send_sms':                handle_admin_send_sms($BODY); break;
-        case 'admin_sms_history':             handle_admin_sms_history(); break;
+        case 'admin_send_email':              handle_admin_send_email($BODY); break;
+        case 'admin_email_history':           handle_admin_email_history(); break;
         case 'admin_ban_user':                handle_admin_ban_user($BODY); break;
         case 'admin_unban_user':              handle_admin_unban_user($BODY); break;
         case 'admin_restrict_messaging':      handle_admin_restrict_messaging($BODY); break;

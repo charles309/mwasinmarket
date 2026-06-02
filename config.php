@@ -9,8 +9,8 @@ declare(strict_types=1);
 
 define('DB_HOST',            $_ENV['DB_HOST']            ?? 'localhost');
 define('DB_NAME',            $_ENV['DB_NAME']            ?? 'mwasinmarket');
-define('DB_USER',            $_ENV['DB_USER']            ?? 'root');
-define('DB_PASS',            $_ENV['DB_PASS']            ?? '');
+define('DB_USER',            $_ENV['DB_USER']            ?? 'mwas');
+define('DB_PASS',            $_ENV['DB_PASS']            ?? 'Mwangi254.');
 define('FRONTEND_URL',       $_ENV['FRONTEND_URL']       ?? '');
 define('DEBUG_MODE',         filter_var($_ENV['DEBUG_MODE'] ?? false, FILTER_VALIDATE_BOOLEAN));
 
@@ -20,20 +20,6 @@ define('MAX_BODY_BYTES',     65536);
 
 define('STICKER_UPLOAD_PATH', $_ENV['STICKER_UPLOAD_PATH'] ?? '/var/www/stickers');
 define('STICKER_BASE_URL',    $_ENV['STICKER_BASE_URL']    ?? '');
-
-define('SMS_PROVIDER',       $_ENV['SMS_PROVIDER']       ?? 'africastalking');
-define('SMS_API_KEY',        $_ENV['SMS_API_KEY']        ?? '');
-define('SMS_USERNAME',       $_ENV['SMS_USERNAME']       ?? '');
-define('SMS_SENDER_ID',      $_ENV['SMS_SENDER_ID']      ?? 'MwasinMkt');
-
-define('MPESA_CONSUMER_KEY',    $_ENV['MPESA_CONSUMER_KEY']    ?? '');
-define('MPESA_CONSUMER_SECRET', $_ENV['MPESA_CONSUMER_SECRET'] ?? '');
-define('MPESA_SHORTCODE',       $_ENV['MPESA_SHORTCODE']       ?? '');
-define('MPESA_PASSKEY',         $_ENV['MPESA_PASSKEY']         ?? '');
-define('MPESA_CALLBACK_URL',    $_ENV['MPESA_CALLBACK_URL']    ?? '');
-define('MPESA_B2C_URL',         $_ENV['MPESA_B2C_URL']         ?? '');
-define('MPESA_IP_WHITELIST',    $_ENV['MPESA_IP_WHITELIST']    ?? '');
-define('MPESA_WEBHOOK_SECRET',  $_ENV['MPESA_WEBHOOK_SECRET']  ?? '');
 
 define('LMSR_B',             1000);
 define('LMSR_B_MIN',         50);

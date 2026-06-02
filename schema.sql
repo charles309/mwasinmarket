@@ -332,25 +332,23 @@ CREATE TABLE IF NOT EXISTS market_chats (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ============================================================
--- 15. sms_log
+-- 15. email_log  (audit of every notification sent via SMTP)
 -- ============================================================
-CREATE TABLE IF NOT EXISTS sms_log (
+CREATE TABLE IF NOT EXISTS email_log (
     id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
     user_id     BIGINT UNSIGNED NULL,
-    phone       VARCHAR(20) NOT NULL,
-    message     VARCHAR(160) NOT NULL,
+    email       VARCHAR(254) NOT NULL,
+    subject     VARCHAR(200) NOT NULL,
     status      ENUM('queued','sent','failed') NOT NULL DEFAULT 'queued',
-    provider    VARCHAR(40) NOT NULL DEFAULT 'africastalking',
-    provider_id VARCHAR(100) NULL,
-    sent_by     BIGINT UNSIGNED NULL,
+    sent_by     BIGINT UNSIGNED NULL,                       -- admin id if sent by admin, NULL = system
     error       VARCHAR(300) NULL,
     created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (id),
-    KEY idx_user_created (user_id, created_at),
-    KEY idx_status       (status),
-    KEY idx_created_at   (created_at),
-    CONSTRAINT fk_sms_user    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL,
-    CONSTRAINT fk_sms_sent_by FOREIGN KEY (sent_by) REFERENCES users(id) ON DELETE SET NULL
+    KEY idx_email_user_created (user_id, created_at),
+    KEY idx_email_status       (status),
+    KEY idx_email_created_at   (created_at),
+    CONSTRAINT fk_email_user    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL,
+    CONSTRAINT fk_email_sent_by FOREIGN KEY (sent_by) REFERENCES users(id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ============================================================
