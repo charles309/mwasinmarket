@@ -168,6 +168,11 @@ function handle_profile(): void {
     $stats->execute([':uid' => $auth['user_id']]);
     $bs = $stats->fetch();
 
+    // Profile is what the user sees. We hide cumulative "money won" and
+    // payout totals to avoid loss-chasing / discouragement signalling.
+    // Settled vs open counts are kept so users can still navigate their
+    // history (open vs settled) but without anchoring on a money figure.
+    $settled = (int)$bs['won_bets'] + (int)$bs['lost_bets'] + (int)$bs['void_bets'];
     ok([
         'user_id'              => (int)$user['id'],
         'username'             => $user['username'],
@@ -184,15 +189,11 @@ function handle_profile(): void {
         'locked_balance'       => (float)$user['locked_balance'],
         'available_balance'    => (float)$user['balance'] - (float)$user['locked_balance'],
         'bonus_balance'        => (float)$user['bonus_balance'],
-        'total_wins'           => (float)$user['total_wins'],
         'member_since'         => $user['created_at'],
         'bet_stats' => [
-            'total'         => (int)$bs['total_bets'],
-            'open'          => (int)$bs['open_bets'],
-            'won'           => (int)$bs['won_bets'],
-            'lost'          => (int)$bs['lost_bets'],
-            'void'          => (int)$bs['void_bets'],
-            'total_payout'  => (float)$bs['total_payout'],
+            'total'   => (int)$bs['total_bets'],
+            'open'    => (int)$bs['open_bets'],
+            'settled' => $settled,
         ],
     ]);
 }

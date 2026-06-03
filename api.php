@@ -210,7 +210,10 @@ if ($ROUTE === 'routes') {
 
 // Note: 'routes' itself does its own auth check above; we still let it bypass
 // the maintenance gate so admins can introspect during downtime.
-$MAINTENANCE_BYPASS = ['admin_login', 'admin_maintenance', 'health', 'routes'];
+// admin_deposit_pause is in the bypass list so admins can still toggle
+// deposits / read system state while full-platform maintenance is on,
+// otherwise the admin Settings page itself becomes unreachable.
+$MAINTENANCE_BYPASS = ['admin_login', 'admin_maintenance', 'admin_deposit_pause', 'health', 'routes'];
 if (!in_array($ROUTE, $MAINTENANCE_BYPASS, true)) {
     check_maintenance();
 }

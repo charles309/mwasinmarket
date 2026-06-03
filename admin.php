@@ -995,6 +995,47 @@ header("Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-i
       ])
     ));
 
+    // What-if house P/L: per-outcome projection, plus void / kept-all.
+    const wi = data.data.what_if;
+    if (wi) {
+      const pl = function (n) {
+        const s = fmtKes(Math.abs(n));
+        return el('span', { class: n >= 0 ? 'text-success' : 'text-danger',
+                            text: (n >= 0 ? '+' : '−') + s });
+      };
+      const rows = (wi.outcomes || []).map(function (o) {
+        return {
+          outcome: o.outcome_name + ' (id ' + o.outcome_id + ')',
+          open_stake: fmtKes(o.open_stake_for),
+          payout: fmtKes(o.open_payout_if_wins),
+          house: pl(o.house_pl_if_wins)
+        };
+      });
+      // Append the two whole-market scenarios as rows at the bottom.
+      rows.push({
+        outcome: el('span', { class: 'text-muted', text: 'Voided now (refund all)' }),
+        open_stake: fmtKes(wi.total_open_stake),
+        payout: fmtKes(wi.total_open_stake),
+        house: pl(wi.house_pl_if_voided_now)
+      });
+      rows.push({
+        outcome: el('span', { class: 'text-muted', text: 'Market never happened / keep all stakes' }),
+        open_stake: fmtKes(wi.total_open_stake),
+        payout: 'KES 0.00',
+        house: pl(wi.house_pl_if_kept_all)
+      });
+      main.appendChild(el('div', { class: 'card' },
+        el('h2', { text: 'House P/L — what-if I settle now' }),
+        el('div', { class: 'page-sub', text: 'Open book only: ' + fmtKes(wi.total_open_stake) + ' is currently at risk on this market.' }),
+        tableFrom(rows, [
+          { k: 'outcome',    label: 'If this outcome wins' },
+          { k: 'open_stake', label: 'Open stake on it' },
+          { k: 'payout',     label: 'Payout to winners' },
+          { k: 'house',      label: 'House P/L' }
+        ])
+      ));
+    }
+
     const isTerminal = (m.status === 'resolved' || m.status === 'voided');
     function actBtn(show, cls, label, onclick) {
       if (!show) return null;
@@ -1857,8 +1898,12 @@ header("Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-i
     clear(main);
     main.appendChild(el('div', { class: 'page-head' }, el('h1', { text: 'Settings' })));
 
-    const mt = await api('admin_maintenance');
-    const dp = await api('admin_deposit_pause');
+    // Load both independently: if one is 503 (maintenance kicked in) we
+    // still want the page to render so the admin can disable it.
+    const safe = async function (p) { try { return await p; } catch (e) {
+      return { data: {}, _error: e.message }; } };
+    const mt = await safe(api('admin_maintenance'));
+    const dp = await safe(api('admin_deposit_pause'));
 
     const mtMsg = el('input', { class: 'input', value: (mt.data && mt.data.message) || '' });
     main.appendChild(el('div', { class: 'card' },

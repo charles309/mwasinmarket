@@ -1756,6 +1756,49 @@ function handle_admin_market_report(): void {
     foreach ($vols as $v) { if (true) $stakeAtRisk += (float)$v['volume']; }
     $houseProfit = (float)$bs['total_stake'] - (float)$bs['total_payout'];
 
+    // -------- What-if house P/L per potential settlement --------
+    // We need open-stake per outcome (separate from non-void volume) so the
+    // projection only counts money that is still at risk on this market.
+    $openByOut = db()->prepare("SELECT outcome_id,
+        COALESCE(SUM(stake),0)        AS open_stake,
+        COALESCE(SUM(possible_win),0) AS open_payout
+        FROM bets WHERE market_id = :mid AND status = 'open' GROUP BY outcome_id");
+    $openByOut->execute([':mid' => $m['id']]);
+    $openMap = [];
+    foreach ($openByOut->fetchAll() as $r) {
+        $openMap[(int)$r['outcome_id']] = [
+            'open_stake'  => (float)$r['open_stake'],
+            'open_payout' => (float)$r['open_payout'],
+        ];
+    }
+    $totalOpenStake = 0.0;
+    foreach ($openMap as $r) $totalOpenStake += $r['open_stake'];
+
+    // For each outcome i, "if i wins now":
+    //   house P/L = (every open bet's stake) - (open bets on i payout)
+    // i.e. losers' stakes minus winners' payout, on the open book.
+    $whatIfOutcomes = [];
+    foreach ($snap as $s) {
+        $oid = (int)$s['outcome_id'];
+        $payout = $openMap[$oid]['open_payout'] ?? 0.0;
+        $whatIfOutcomes[] = [
+            'outcome_id'       => $oid,
+            'outcome_name'     => $s['name'],
+            'open_stake_for'   => round($openMap[$oid]['open_stake'] ?? 0.0, 2),
+            'open_payout_if_wins' => round($payout, 2),
+            'house_pl_if_wins'  => round($totalOpenStake - $payout, 2),
+        ];
+    }
+    $whatIf = [
+        'total_open_stake'        => round($totalOpenStake, 2),
+        'outcomes'                => $whatIfOutcomes,
+        // Void refunds everyone: house earns zero from this market's open book.
+        'house_pl_if_voided_now'  => 0.0,
+        // "Market didn't happen, keep all stakes" — i.e. force-close with no
+        // settlement, every open bet's stake is recognised as house revenue.
+        'house_pl_if_kept_all'    => round($totalOpenStake, 2),
+    ];
+
     $graphStmt = db()->prepare("SELECT s.outcome_id, o.name AS outcome_name,
         MIN(s.created_at) AS first_at, MAX(s.created_at) AS last_at,
         COUNT(*) AS samples,
@@ -1821,6 +1864,7 @@ function handle_admin_market_report(): void {
             'house_profit'  => round($houseProfit, 2),
         ],
         'volume_by_outcome' => $volumeByOutcome,
+        'what_if'           => $whatIf,
         'graph_summary'     => $graphRows,
         'audit_log'         => $audit,
     ]);
