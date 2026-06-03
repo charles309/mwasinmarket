@@ -20,7 +20,10 @@ function db(): PDO {
         $dsn = sprintf('mysql:host=%s;dbname=%s;charset=utf8mb4', DB_HOST, DB_NAME);
         $pdo = new PDO($dsn, DB_USER, DB_PASS, [
             PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
-            PDO::ATTR_EMULATE_PREPARES   => false,
+            // Emulate prepares ON: lets PDO rewrite reused :name placeholders.
+            // Still SQL-injection safe (PDO escapes all bound values), and the
+            // utf8mb4 DSN charset removes the historical mb-edge cases.
+            PDO::ATTR_EMULATE_PREPARES   => true,
             PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
             PDO::ATTR_PERSISTENT         => false,
         ]);

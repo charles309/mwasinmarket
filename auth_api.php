@@ -67,8 +67,10 @@ function handle_login(array $body): void {
     $identifier = _login_identifier($body);
     if ($identifier === '' || $password === '') fail('Invalid credentials.', 401);
 
-    $stmt = db()->prepare("SELECT id, username, email, phone, role, balance, locked_balance, bonus_balance, password_hash, is_suspended FROM users WHERE (username = :id OR email = :id OR phone = :id) LIMIT 1");
-    $stmt->execute([':id' => $identifier]);
+    // Distinct placeholders: MySQL native prepares do not allow reusing the
+    // same named placeholder; we bind the same value to three different keys.
+    $stmt = db()->prepare("SELECT id, username, email, phone, role, balance, locked_balance, bonus_balance, password_hash, is_suspended FROM users WHERE (username = :u OR email = :e OR phone = :p) LIMIT 1");
+    $stmt->execute([':u' => $identifier, ':e' => $identifier, ':p' => $identifier]);
     $user = $stmt->fetch();
 
     if (!$user) { password_verify($password, DUMMY_HASH); fail('Invalid credentials.', 401); }
@@ -103,8 +105,10 @@ function handle_admin_login(array $body): void {
     $identifier = _login_identifier($body);
     if ($identifier === '' || $password === '') fail('Invalid credentials.', 401);
 
-    $stmt = db()->prepare("SELECT id, username, email, phone, role, balance, locked_balance, bonus_balance, password_hash, is_suspended FROM users WHERE (username = :id OR email = :id OR phone = :id) LIMIT 1");
-    $stmt->execute([':id' => $identifier]);
+    // Distinct placeholders: MySQL native prepares do not allow reusing the
+    // same named placeholder; we bind the same value to three different keys.
+    $stmt = db()->prepare("SELECT id, username, email, phone, role, balance, locked_balance, bonus_balance, password_hash, is_suspended FROM users WHERE (username = :u OR email = :e OR phone = :p) LIMIT 1");
+    $stmt->execute([':u' => $identifier, ':e' => $identifier, ':p' => $identifier]);
     $user = $stmt->fetch();
 
     if (!$user) { password_verify($password, DUMMY_HASH); fail('Invalid credentials.', 401); }
