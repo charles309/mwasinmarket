@@ -762,6 +762,27 @@ header("Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-i
     );
     main.appendChild(grid);
 
+    // Live exposure across every open market (cash only).
+    if (d.exposure) {
+      const ex = d.exposure;
+      const net = ex.net_if_worst_case;
+      const netNode = el('span', { class: net >= 0 ? 'text-success' : 'text-danger',
+                                    text: (net >= 0 ? '+' : '−') + fmtKes(Math.abs(net)) });
+      const exGrid = el('div', { class: 'stats' },
+        sc('Open cash stake',    fmtKes(ex.open_stake),          'Across ' + ex.markets_with_open_book + ' open markets'),
+        sc('Max liability',      fmtKes(ex.max_liability_total), 'If every worst outcome wins'),
+        el('div', { class: 'stat-card accent' },
+          el('div', { class: 'stat-label', text: 'Worst-case house P/L' }),
+          el('div', { class: 'stat-value' }, netNode),
+          el('div', { class: 'stat-meta', text: 'Cash only · bonus excluded' })
+        )
+      );
+      main.appendChild(el('div', { class: 'card' },
+        el('h2', { text: 'Live exposure (open book)' }),
+        exGrid
+      ));
+    }
+
     main.appendChild(el('div', { class: 'card' },
       el('h2', { text: 'Top bettors' }),
       tableFrom(d.top_bettors || [], [
@@ -1026,7 +1047,7 @@ header("Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-i
       });
       main.appendChild(el('div', { class: 'card' },
         el('h2', { text: 'House P/L — what-if I settle now' }),
-        el('div', { class: 'page-sub', text: 'Open book only: ' + fmtKes(wi.total_open_stake) + ' is currently at risk on this market.' }),
+        el('div', { class: 'page-sub', text: 'Cash bets only (bonus excluded). Open book: ' + fmtKes(wi.total_open_stake) + ' currently at risk on this market.' }),
         tableFrom(rows, [
           { k: 'outcome',    label: 'If this outcome wins' },
           { k: 'open_stake', label: 'Open stake on it' },

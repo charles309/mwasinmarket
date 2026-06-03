@@ -1663,6 +1663,31 @@ function handle_admin_stats(): void {
         FROM bets")->fetch();
     $houseProfit = (float)$fin['total_wagered'] - (float)$fin['total_payouts'] - (float)$fin['total_refunds'];
 
+    // Live exposure across the open book on every non-terminal market.
+    // Cash-only (is_bonus_bet=0) so the numbers mean real-money risk.
+    // max_liability_total: worst-case payout if the most-backed outcome on
+    // every market wins; this is the upper bound on house cash outflow.
+    $exposure = $pdo->query("
+        SELECT
+          COALESCE(SUM(t.open_stake),0)                    AS open_stake,
+          COALESCE(SUM(t.max_outcome_payout),0)            AS max_liability_total,
+          COUNT(DISTINCT CASE WHEN t.open_stake > 0 THEN t.market_id END) AS markets_with_open_book
+        FROM (
+          SELECT b.market_id,
+                 SUM(b.stake)        AS open_stake,
+                 MAX(per_outcome)    AS max_outcome_payout
+          FROM bets b
+          JOIN (
+            SELECT market_id, outcome_id, SUM(possible_win) AS per_outcome
+            FROM bets
+            WHERE status = 'open' AND is_bonus_bet = 0
+            GROUP BY market_id, outcome_id
+          ) o ON o.market_id = b.market_id
+          WHERE b.status = 'open' AND b.is_bonus_bet = 0
+          GROUP BY b.market_id
+        ) t
+    ")->fetch();
+
     $topBettors = $pdo->query("SELECT u.username, COALESCE(SUM(b.stake),0) AS total_wagered,
         COALESCE(SUM(CASE WHEN b.status='won' THEN b.payout ELSE 0 END),0) AS total_wins,
         COUNT(b.id) AS bet_count
@@ -1696,6 +1721,13 @@ function handle_admin_stats(): void {
             'house_profit'  => round($houseProfit, 2),
             'bets_today'    => (int)$fin['bets_today'],
             'wagered_today' => (float)$fin['wagered_today'],
+        ],
+        'exposure' => [
+            'scope'                  => 'cash_only',
+            'open_stake'             => (float)$exposure['open_stake'],
+            'max_liability_total'    => (float)$exposure['max_liability_total'],
+            'markets_with_open_book' => (int)$exposure['markets_with_open_book'],
+            'net_if_worst_case'      => round((float)$exposure['open_stake'] - (float)$exposure['max_liability_total'], 2),
         ],
         'top_bettors' => $topBettors,
         'generated_at' => gmdate('Y-m-d H:i:s'),
@@ -1759,10 +1791,14 @@ function handle_admin_market_report(): void {
     // -------- What-if house P/L per potential settlement --------
     // We need open-stake per outcome (separate from non-void volume) so the
     // projection only counts money that is still at risk on this market.
+    // Cash-only: bonus bets settle in bonus_balance (not real money) so
+    // including them would inflate or distort house P/L numbers.
     $openByOut = db()->prepare("SELECT outcome_id,
         COALESCE(SUM(stake),0)        AS open_stake,
         COALESCE(SUM(possible_win),0) AS open_payout
-        FROM bets WHERE market_id = :mid AND status = 'open' GROUP BY outcome_id");
+        FROM bets
+        WHERE market_id = :mid AND status = 'open' AND is_bonus_bet = 0
+        GROUP BY outcome_id");
     $openByOut->execute([':mid' => $m['id']]);
     $openMap = [];
     foreach ($openByOut->fetchAll() as $r) {
@@ -1790,6 +1826,7 @@ function handle_admin_market_report(): void {
         ];
     }
     $whatIf = [
+        'scope'                   => 'cash_only', // bonus bets excluded
         'total_open_stake'        => round($totalOpenStake, 2),
         'outcomes'                => $whatIfOutcomes,
         // Void refunds everyone: house earns zero from this market's open book.
